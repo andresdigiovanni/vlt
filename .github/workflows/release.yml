@@ -1,0 +1,211 @@
+name: Release
+
+# Manually triggered ("Run workflow"). On trigger it:
+#   1. reads the version from Cargo.toml,
+#   2. syncs Cargo.lock if the version drifted (auto-commits and pushes),
+#   3. runs cargo test — a red suite blocks the release,
+#   4. promotes `## [Unreleased]` content into `## [<version>]` in
+#      CHANGELOG.md (and commits + pushes that change back to the triggered
+#      branch), so the published release notes are never sparse just because
+#      the maintainer didn't pre-stage the [<version>] block by hand,
+#   5. builds a release binary for every platform (rusqlite bundles C, so each
+#      target is built on a runner of its own OS; macos-14 builds x86_64 from
+#      its arm64 toolchain with the Apple cross target). The build job runs on
+#      the triggered commit, before steps 2 and 4 push Cargo.lock/CHANGELOG.md
+#      commits, so the tag below points at a commit that differs from the built
+#      one only by those two files,
+#   6. creates the GitHub Release (tag v<version>) with all archives and a
+#      SHA256SUMS file, using the release notes from CHANGELOG.md.
+#
+# Before triggering: bump the `version` in Cargo.toml. CHANGELOG.md entries
+# can live under `## [Unreleased]` — step 4 takes care of moving them.
+#
+# Re-running for the same version is safe: an existing release gets its
+# assets refreshed (--clobber) instead of failing.
+#
+# Auth note: pushes back to the branch use the default GITHUB_TOKEN. If
+# branch-protection rulesets on main ever block github-actions[bot] pushes,
+# mirror codegraph: check out with a fine-grained PAT secret
+# (RELEASE_PAT, contents:write only) instead of github.token.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write      # create the GitHub Release + tag, push CHANGELOG/Cargo.lock promotes
+  id-token: write      # OIDC token for Sigstore signing (attest-build-provenance)
+  attestations: write  # store the GitHub artifact attestations for the bundles
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04 # oldest glibc runner → widest compatibility
+            targets: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            targets: aarch64-unknown-linux-gnu
+          - runner: macos-14
+            targets: aarch64-apple-darwin x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Add rust targets
+        shell: bash
+        run: |
+          for t in ${{ matrix.targets }}; do
+            rustup target add "$t"
+          done
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        # First `^version` in Cargo.toml is the [package] version; `rust-version`
+        # and dependency lines don't match the anchored pattern.
+        run: echo "version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        shell: bash
+        run: |
+          for t in ${{ matrix.targets }}; do
+            if ! cargo build --release --locked --target "$t"; then
+              echo "::warning::--locked build failed for $t (likely Cargo.toml/Cargo.lock version drift); syncing lock entry and retrying"
+              cargo update -p vlt
+              cargo build --release --locked --target "$t"
+            fi
+          done
+
+      - name: Package
+        shell: bash
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          for t in ${{ matrix.targets }}; do
+            tar -czf "vlt-v${V}-${t}.tar.gz" -C "target/${t}/release" vlt
+          done
+          ls -lh vlt-v*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.runner }}
+          path: vlt-v*
+          if-no-files-found: error
+
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Explicit branch checkout so the promote pushes below know where to go.
+          ref: ${{ github.ref }}
+
+      - name: Resolve version
+        id: ver
+        run: echo "version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)" >> "$GITHUB_OUTPUT"
+
+      - name: Sync Cargo.lock if version drifted
+        # The Rust equivalent of codegraph's package-lock sync: bumping
+        # Cargo.toml without regenerating Cargo.lock fails every --locked
+        # build. Rewrite the workspace package's version entry, commit, push.
+        # Idempotent: no-op when versions already match.
+        run: |
+          set -euo pipefail
+          lock_version() {
+            grep -m1 -A1 '^name = "vlt"$' Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p'
+          }
+          PKG_V="${{ steps.ver.outputs.version }}"
+          LOCK_V=$(lock_version)
+          if [ "$PKG_V" = "$LOCK_V" ]; then
+            echo "Cargo.lock already at $PKG_V — nothing to sync."
+            exit 0
+          fi
+          echo "Version drift: lock=$LOCK_V, package=$PKG_V. Syncing."
+          cargo update -p vlt
+          NEW_LOCK_V=$(lock_version)
+          if [ "$NEW_LOCK_V" != "$PKG_V" ]; then
+            echo "::error::Cargo.lock still at $NEW_LOCK_V after sync attempt; expected $PKG_V"
+            exit 1
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git commit -m "release: sync Cargo.lock to ${PKG_V}" -m "[skip ci] Auto-generated by Release workflow."
+          git push origin "HEAD:${GITHUB_REF#refs/heads/}"
+
+      - name: Run tests (release gate)
+        run: cargo test
+
+      - name: Promote [Unreleased] → [<version>] in CHANGELOG.md
+        # Idempotent: a no-op if [Unreleased] is empty OR if the previous run
+        # already moved everything. Auto-commit + push the change back so the
+        # version block on the branch is the source of truth going forward.
+        run: |
+          set -euo pipefail
+          V="${{ steps.ver.outputs.version }}"
+          bash scripts/prepare-release.sh "$V"
+          if git diff --quiet -- CHANGELOG.md; then
+            echo "CHANGELOG.md unchanged — nothing to commit."
+          else
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add CHANGELOG.md
+            git commit -m "docs(changelog): promote [Unreleased] into [${V}]" -m "[skip ci] Auto-generated by Release workflow."
+            git push origin "HEAD:${GITHUB_REF#refs/heads/}"
+          fi
+
+      - name: Download bundles
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bundle-*
+          merge-multiple: true
+          path: release/
+
+      - name: Generate SHA256SUMS
+        # Published as a release asset; basenames only so verification scripts
+        # can match with path.basename.
+        run: |
+          (cd release && sha256sum vlt-v* > SHA256SUMS)
+          cat release/SHA256SUMS
+
+      - name: Attest build provenance for release bundles
+        # Signed, publicly-verifiable proof that each asset was built by this
+        # workflow from this repo. Verify with:
+        #   gh attestation verify <file> -R <owner>/<repo>
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            release/vlt-v*
+            release/SHA256SUMS
+
+      - name: Release notes from CHANGELOG.md
+        # The [<version>] block was just promoted, so the [Unreleased]
+        # fallback should never be needed in practice. Kept for
+        # defense-in-depth, like codegraph.
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          bash scripts/extract-release-notes.sh "$V" > notes.md 2>/dev/null \
+            || bash scripts/extract-release-notes.sh Unreleased > notes.md \
+            || true
+          if [ ! -s notes.md ]; then
+            echo "::error::No release notes in CHANGELOG.md for [${V}] or [Unreleased]."
+            exit 1
+          fi
+          echo "----- release notes -----"
+          cat notes.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${{ steps.ver.outputs.version }}"
+          # Idempotent: create the release once, otherwise (re-run) refresh assets.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release/vlt-v* release/SHA256SUMS --clobber
+          else
+            # --target pins the tag to this checkout (the triggered branch, including
+            # the promote commits pushed above), not to the default branch's HEAD.
+            gh release create "$TAG" release/vlt-v* release/SHA256SUMS --title "$TAG" --notes-file notes.md --target "$(git rev-parse HEAD)"
+          fi
