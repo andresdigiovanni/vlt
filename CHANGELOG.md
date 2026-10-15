@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-15
+
 ### Added
 
 - Any Hugging Face model whose architecture vlt can run is accepted in `[models]`, without a built-in list: embedding models of type `bert`, `xlm-roberta` and `qwen3` (e.g. `BAAI/bge-large-en-v1.5`, `Qwen/Qwen3-Embedding-0.6B`) and `bert`, `xlm-roberta` and `deberta-v2` cross-encoders as rerankers (e.g. `mixedbread-ai/mxbai-rerank-large-v1`). Pooling, query and document prompts and maximum length come from the repo's sentence-transformers files.
