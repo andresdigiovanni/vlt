@@ -16,16 +16,17 @@ Your notes hold what no model knows: your projects, your past decisions, your co
 
 vlt fixes all three:
 
-```text
-"what did we decide about retries?"
-        │
-        ▼
-   ┌──────────┐   BM25 (keywords) ──┐
-   │  search  │                     ├─ fused (RRF) ─▶ reranked ─▶ top sections
-   └──────────┘   vectors (meaning)─┘                              above a threshold
-        │
-        ▼
- answer that cites projects/api.md#Retry policy
+```mermaid
+flowchart LR
+    Q(["what did we decide<br/>about retries?"]) --> F["filters<br/>property · folder"]
+    F --> B["BM25<br/>keywords"]
+    F --> V["vectors<br/>meaning"]
+    B --> R["fused<br/>RRF"]
+    V --> R
+    R --> X["reranked<br/>cross-encoder"]
+    X --> T{"above the<br/>threshold?"}
+    T -- yes --> A(["answer that cites<br/>projects/api.md#Retry policy"])
+    T -- no --> D["dropped"]
 ```
 
 - **Hybrid search**: keyword search (SQLite FTS5) and semantic search (sqlite-vec) over the sections of every note, fused with Reciprocal Rank Fusion and reranked by a local cross-encoder. Results below a relevance threshold are dropped, so "nothing relevant" is an answer, not five random hits.
@@ -151,6 +152,21 @@ The agent uses vlt in two flows:
 - **Answering.** When you ask what you know or wrote about something, or when the task depends on your notes (one of your projects, a past decision, a convention), the agent searches the vault, reads what it needs and cites the sections it used (`projects/mcp_rust.md#Concurrency`).
 - **Enriching.** When you ask it to process a note, add properties to it or link it, the agent proposes one numbered list: properties, links from the note, links to it from other notes, and repairs for broken links. You pick ("apply 1, 3"), and it writes only those.
 
+```mermaid
+sequenceDiagram
+    actor You
+    participant Agent
+    participant vlt
+    You->>Agent: Process the note projects/vlt_design.md
+    Agent->>vlt: get · properties · search
+    vlt-->>Agent: the note, the vault's vocabulary, related notes
+    Agent->>You: numbered list: properties, links, repairs
+    You->>Agent: apply 1, 3
+    Agent->>vlt: update_properties · edit (items 1 and 3 only)
+    vlt-->>Agent: diff, note reindexed
+    Agent->>You: what was applied
+```
+
 ### From the terminal
 
 ```bash
@@ -268,6 +284,22 @@ Models compute in the precision their weights are stored in: 16-bit weights (F16
 Model size sets speed and memory on a CPU, and the reranker dominates both: it reads every candidate in full. Measured on an Apple M-series CPU, reranking 10 sections of ~290 tokens (the default `rerank_top`) takes about 5 s with `mixedbread-ai/mxbai-rerank-base-v1` (the default), 15 s with `mixedbread-ai/mxbai-rerank-large-v1`, 2.3 s with `mixedbread-ai/mxbai-rerank-xsmall-v1` and 0.8 s with `cross-encoder/ms-marco-MiniLM-L-6-v2`; time grows in proportion to `rerank_top` and to section length. With the defaults vlt peaks at about 2.3 GB of memory; `BAAI/bge-small-en-v1.5` with `cross-encoder/ms-marco-MiniLM-L-6-v2` (the defaults of vlt 0.1.0) need about 350 MB.
 
 ## Where everything lives
+
+```mermaid
+flowchart LR
+    agent["AI agent<br/>Claude Code · opencode · Codex"] -- "MCP (stdio)" --> vlt
+    you["you"] -- "vlt CLI" --> vlt
+    subgraph home["~/.vlt/"]
+        config["config.toml"]
+        index[("index<br/>SQLite: FTS5 + sqlite-vec")]
+        models["models<br/>embedding + reranker"]
+    end
+    vlt --- config
+    vlt --- index
+    vlt --- models
+    vlt -- "reads changed notes" --> vault[/"your vault<br/>markdown notes"/]
+    vlt -. "edit · update_properties<br/>only what you approve" .-> vault
+```
 
 ```text
 ~/.vlt/
