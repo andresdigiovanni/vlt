@@ -45,6 +45,11 @@ fn main() {
     std::os::unix::fs::symlink(real_home.join("models"), home.join("models")).unwrap();
     let cfg = Config::parse(&Config::default_toml(&vault)).unwrap();
     let app = App::new(home.clone(), cfg, false).unwrap();
+    for m in app.models.refs() {
+        if vlt::installer::models::missing(&home.join("models"), &m.id, &m.revision) {
+            vlt::installer::models::pull(&home.join("models"), &m.id, &m.revision, vlt::installer::models::HF_BASE, &mut |_, _, _| {}).unwrap();
+        }
+    }
 
     let t = Instant::now();
     app.reindex(false, &mut |_, _| {}).unwrap();

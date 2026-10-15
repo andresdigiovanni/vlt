@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::ml::{Embedder, Reranker, QUERY_PREFIX};
+use crate::ml::{Embedder, Reranker};
 use crate::Result;
 
 pub const FAKE_MODEL_ID: &str = "fake";
@@ -31,7 +31,6 @@ impl Embedder for FakeEmbedder {
         Ok(texts
             .iter()
             .map(|text| {
-                let text = text.strip_prefix(QUERY_PREFIX).unwrap_or(text);
                 let mut v = vec![0f32; FAKE_DIM];
                 for t in tokens(text) {
                     v[(fnv1a(&t) % FAKE_DIM as u64) as usize] += 1.0;
@@ -69,7 +68,7 @@ impl Reranker for FakeReranker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ml::{Embedder, Reranker, QUERY_PREFIX};
+    use crate::ml::{Embedder, Reranker};
     fn dot(a: &[f32], b: &[f32]) -> f32 { a.iter().zip(b).map(|(x, y)| x * y).sum() }
 
     #[test]
@@ -82,8 +81,7 @@ mod tests {
         assert!((dot(&v[0], &v[0]) - 1.0).abs() < 1e-5);
         assert!(dot(&v[0], &v[1]) > dot(&v[0], &v[2]));
         assert!(v[3].iter().all(|x| *x == 0.0));
-        let q = e.embed(&[&format!("{QUERY_PREFIX}sqlite wal mode")]).unwrap();
-        assert_eq!(q[0], v[0], "query prefix is ignored");
+        assert_eq!(e.embed_query("sqlite wal mode").unwrap(), v[0], "queries embed like documents");
         assert_eq!(e.count_tokens("a b  c"), 3);
     }
 

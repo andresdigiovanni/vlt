@@ -280,10 +280,10 @@ fn pull_missing_models(app: &App) -> Result<()> {
         return Ok(());
     }
     let dir = paths::models_dir(&app.home);
-    for spec in app.models.specs() {
-        if missing(&dir, spec) {
-            pull_showing_progress(&dir, spec)?;
+    for model in app.models.refs() {
+        if missing(&dir, &model.id, &model.revision) {
+            pull_showing_progress(&dir, &model.id, &model.revision)?;
         }
     }
-    Ok(())
+    app.models.check()
 }

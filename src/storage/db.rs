@@ -6,6 +6,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::{Result, VltError};
 use crate::indexer::parser::{Heading, RawLink};
+use crate::ml::profile::LEGACY_FINGERPRINT;
 
 pub const SCHEMA_VERSION: &str = "1";
 
@@ -13,6 +14,8 @@ pub const SCHEMA_VERSION: &str = "1";
 pub struct IndexMeta {
     pub model_id: String,
     pub dim: usize,
+    /// Everything else that shapes the stored vectors (commit, pooling, document prefix…).
+    pub fingerprint: String,
     pub vault: String,
 }
 
@@ -186,6 +189,12 @@ fn mismatch(key: &str, found: Option<&str>, expected: &str) -> VltError {
     }
 }
 
+/// The stored fingerprint; indexes from vlt 0.1.0 have none, and could only have been built
+/// with what `LEGACY_FINGERPRINT` describes.
+fn fingerprint_value(conn: &Connection) -> Result<String> {
+    Ok(meta_value(conn, "fingerprint")?.unwrap_or_else(|| LEGACY_FINGERPRINT.to_string()))
+}
+
 fn check_meta(conn: &Connection, expected: &IndexMeta) -> Result<()> {
     let dim = expected.dim.to_string();
     let wanted = [
@@ -200,6 +209,10 @@ fn check_meta(conn: &Connection, expected: &IndexMeta) -> Result<()> {
             return Err(mismatch(key, found.as_deref(), want));
         }
     }
+    let found = fingerprint_value(conn)?;
+    if found != expected.fingerprint {
+        return Err(mismatch("fingerprint", Some(&found), &expected.fingerprint));
+    }
     Ok(())
 }
 
@@ -209,6 +222,7 @@ fn write_meta(conn: &Connection, meta: &IndexMeta) -> Result<()> {
         ("schema_version", SCHEMA_VERSION),
         ("model_id", meta.model_id.as_str()),
         ("dim", dim.as_str()),
+        ("fingerprint", meta.fingerprint.as_str()),
         ("vault", meta.vault.as_str()),
     ];
     for (key, value) in rows {
@@ -231,7 +245,7 @@ pub fn read_meta(conn: &Connection) -> Result<Option<IndexMeta>> {
     let dim = dim_text.parse::<usize>().map_err(|_| {
         VltError::IndexRebuildRequired(format!("dim is not a number in the index: `{dim_text}`"))
     })?;
-    Ok(Some(IndexMeta { model_id: get("model_id")?, dim, vault: get("vault")? }))
+    Ok(Some(IndexMeta { model_id: get("model_id")?, dim, fingerprint: fingerprint_value(conn)?, vault: get("vault")? }))
 }
 
 pub fn reset_schema(conn: &Connection, meta: &IndexMeta) -> Result<()> {
@@ -357,7 +371,7 @@ mod tests {
     use crate::indexer::parser::{Heading, LinkKind, RawLink};
     use tempfile::tempdir;
 
-    fn meta() -> IndexMeta { IndexMeta { model_id: "fake".into(), dim: 2, vault: "/v".into() } }
+    fn meta() -> IndexMeta { IndexMeta { model_id: "fake".into(), dim: 2, fingerprint: "fake".into(), vault: "/v".into() } }
     fn file(path: &str) -> FileRow {
         FileRow { path: path.into(), mtime_ns: 1, size: 2, sha256: "h".into(), title: "T".into(),
                   properties: Some(serde_json::json!({"tags": ["a"]}).as_object().unwrap().clone()), frontmatter_error: None }
@@ -398,8 +412,22 @@ mod tests {
         assert!(msg(&m).starts_with("dim"), "{}", msg(&m));
         let mut m = meta(); m.vault = "/w".into();
         assert!(msg(&m).starts_with("vault"), "{}", msg(&m));
+        let mut m = meta(); m.fingerprint = "other".into();
+        assert!(msg(&m).starts_with("fingerprint"), "{}", msg(&m));
         Db::open_unchecked(&p).unwrap().conn().execute("UPDATE meta SET value = '0' WHERE key = 'schema_version'", []).unwrap();
         assert!(msg(&meta()).starts_with("schema_version"), "{}", msg(&meta()));
+    }
+
+    #[test]
+    fn an_index_without_a_fingerprint_was_built_by_0_1_0() {
+        let d = tempdir().unwrap();
+        let p = d.path().join("vlt.db");
+        Db::open(&p, &meta()).unwrap();
+        Db::open_unchecked(&p).unwrap().conn().execute("DELETE FROM meta WHERE key = 'fingerprint'", []).unwrap();
+        let legacy = IndexMeta { fingerprint: LEGACY_FINGERPRINT.into(), ..meta() };
+        Db::open(&p, &legacy).unwrap();
+        assert_eq!(read_meta(Db::open_unchecked(&p).unwrap().conn()).unwrap(), Some(legacy));
+        assert!(matches!(Db::open(&p, &meta()), Err(VltError::IndexRebuildRequired(_))));
     }
 
     #[test]

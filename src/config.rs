@@ -1,4 +1,5 @@
 use crate::error::{Result, VltError};
+use crate::ml::profile::{Pooling, Precision};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -17,19 +18,49 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ModelsConfig {
+    /// Hugging Face repo id of the embedding model.
     pub embedding: String,
+    /// Hugging Face repo id of the reranker (a cross-encoder).
     pub reranker: String,
     pub idle_unload_secs: u64,
+    pub embedding_options: EmbeddingOptions,
+    pub reranker_options: RerankerOptions,
 }
 
 impl Default for ModelsConfig {
     fn default() -> Self {
         ModelsConfig {
-            embedding: "BAAI/bge-small-en-v1.5".into(),
-            reranker: "cross-encoder/ms-marco-MiniLM-L-6-v2".into(),
+            embedding: "Qwen/Qwen3-Embedding-0.6B".into(),
+            reranker: "mixedbread-ai/mxbai-rerank-base-v1".into(),
             idle_unload_secs: 300,
+            embedding_options: EmbeddingOptions::default(),
+            reranker_options: RerankerOptions::default(),
         }
     }
+}
+
+/// Overrides for what the embedding model's repo declares; unset means "as the repo says".
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct EmbeddingOptions {
+    /// Branch, tag or commit to download (default: `main`).
+    pub revision: Option<String>,
+    pub pooling: Option<Pooling>,
+    /// Prepended to search queries.
+    pub query_prefix: Option<String>,
+    /// Prepended to indexed text.
+    pub document_prefix: Option<String>,
+    /// Float type to compute in (default: the one the weights are stored in).
+    pub precision: Option<Precision>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RerankerOptions {
+    /// Branch, tag or commit to download (default: `main`).
+    pub revision: Option<String>,
+    /// Float type to compute in (default: the one the weights are stored in).
+    pub precision: Option<Precision>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -44,7 +75,7 @@ pub struct SearchConfig {
 
 impl Default for SearchConfig {
     fn default() -> Self {
-        SearchConfig { k: 50, rrf_k: 60, rerank_top: 20, limit: 5, min_score: 0.3 }
+        SearchConfig { k: 50, rrf_k: 60, rerank_top: 10, limit: 5, min_score: 0.05 }
     }
 }
 
@@ -68,16 +99,29 @@ impl Config {
 exclude = []
 
 [models]
-embedding = "BAAI/bge-small-en-v1.5"                 # 384 dimensions, ~130 MB
-reranker  = "cross-encoder/ms-marco-MiniLM-L-6-v2"   # ~90 MB
+# Any Hugging Face repo of a supported architecture (see the README); changing the embedding
+# model requires `vlt reindex`, which downloads it and rebuilds the index.
+embedding = "Qwen/Qwen3-Embedding-0.6B"             # 1024 dimensions, ~1.2 GB
+reranker  = "mixedbread-ai/mxbai-rerank-base-v1"    # ~350 MB
 idle_unload_secs = 300                               # unload the models after 5 min without use
+
+# Optional overrides of what the model repos declare:
+# [models.embedding_options]
+# revision = "main"              # branch, tag or commit to download
+# pooling = "cls"                # cls, mean or last
+# query_prefix = "query: "       # prepended to search queries
+# document_prefix = "passage: "  # prepended to indexed text
+# precision = "f32"              # f32 or f16 (default: f16 for 16-bit weights, else f32)
+# [models.reranker_options]
+# revision = "main"
+# precision = "f32"
 
 [search]
 k = 50            # candidates per branch (BM25 and vectors)
 rrf_k = 60        # Reciprocal Rank Fusion constant
-rerank_top = 20   # candidates passed to the reranker
+rerank_top = 10   # candidates passed to the reranker; each one costs reranking time
 limit = 5         # results returned by default
-min_score = 0.3   # reranker threshold [0, 1]; calibrate with real documents
+min_score = 0.05  # reranker threshold [0, 1]; depends on the reranker, calibrate with real documents
 "##
         )
     }
@@ -101,12 +145,12 @@ mod tests {
         let cfg = Config::parse("vault = \"/v\"\n").unwrap();
         assert_eq!(cfg.vault, PathBuf::from("/v"));
         assert!(cfg.exclude.is_empty());
-        assert_eq!(cfg.models.embedding, "BAAI/bge-small-en-v1.5");
-        assert_eq!(cfg.models.reranker, "cross-encoder/ms-marco-MiniLM-L-6-v2");
+        assert_eq!(cfg.models.embedding, "Qwen/Qwen3-Embedding-0.6B");
+        assert_eq!(cfg.models.reranker, "mixedbread-ai/mxbai-rerank-base-v1");
         assert_eq!(cfg.models.idle_unload_secs, 300);
         let s = &cfg.search;
-        assert_eq!((s.k, s.rrf_k, s.rerank_top, s.limit), (50, 60, 20, 5));
-        assert!((s.min_score - 0.3).abs() < 1e-12);
+        assert_eq!((s.k, s.rrf_k, s.rerank_top, s.limit), (50, 60, 10, 5));
+        assert!((s.min_score - 0.05).abs() < 1e-12);
     }
 
     #[test]
@@ -120,6 +164,21 @@ mod tests {
     fn unknown_keys_are_rejected() {
         assert!(matches!(Config::parse("vault = \"/v\"\nfoo = 1\n"), Err(VltError::Config(_))));
         assert!(matches!(Config::parse("vault = \"/v\"\n[search]\nkk = 1\n"), Err(VltError::Config(_))));
+    }
+
+    #[test]
+    fn model_options_parse_and_reject_unknown_keys() {
+        let text = "vault = \"/v\"\n[models]\nembedding = \"BAAI/bge-large-en-v1.5\"\n\
+                    [models.embedding_options]\nrevision = \"v1\"\npooling = \"last\"\nquery_prefix = \"q: \"\n\
+                    [models.reranker_options]\nrevision = \"abc\"\n";
+        let m = Config::parse(text).unwrap().models;
+        assert_eq!(m.embedding, "BAAI/bge-large-en-v1.5");
+        assert_eq!(m.reranker, "mixedbread-ai/mxbai-rerank-base-v1", "the default fills the missing key");
+        let e = &m.embedding_options;
+        assert_eq!((e.revision.as_deref(), e.pooling, e.query_prefix.as_deref(), e.document_prefix.as_deref()), (Some("v1"), Some(Pooling::Last), Some("q: "), None));
+        assert_eq!(m.reranker_options.revision.as_deref(), Some("abc"));
+        assert!(Config::parse("vault = \"/v\"\n[models.embedding_options]\npooling = \"max\"\n").is_err());
+        assert!(Config::parse("vault = \"/v\"\n[models.reranker_options]\npooling = \"cls\"\n").is_err());
     }
 
     #[test]

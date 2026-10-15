@@ -11,7 +11,7 @@ Rust CLI and stdio MCP server (`vlt`, package `vlt`): hybrid semantic search ove
 - `cargo test` — unit tests plus the fast integration tests (`tests/`); must pass before merging. It runs on deterministic fake models.
 - `cargo clippy --all-targets -- -D warnings` — must be clean.
 - `cargo build --release --locked` — CI releases build locked; keep `Cargo.lock` in sync when editing `Cargo.toml` (after a version bump: `cargo update -p vlt`).
-- `cargo bench --bench real_models` — the real-model checks (prints PASS/FAIL per check, exits non-zero on a failure). They load the default models (`BAAI/bge-small-en-v1.5`, `cross-encoder/ms-marco-MiniLM-L-6-v2`) from `~/.vlt/models/`, so run `vlt install` first (it downloads them; once its config exists, `vlt reindex` downloads any that are missing).
+- `cargo bench --bench real_models` — the real-model checks (prints PASS/FAIL per check, exits non-zero on a failure). They load the default models (`Qwen/Qwen3-Embedding-0.6B`, `mixedbread-ai/mxbai-rerank-base-v1`), or the Hugging Face repos named by `VLT_BENCH_EMBEDDING` / `VLT_BENCH_RERANKER`, from the models dir of the vlt home (`~/.vlt/models/`, or `$VLT_HOME/models/`), downloading any that is missing. Run them for every architecture a change touches (see README → Models).
 - `cargo bench --bench latency` — the PRD 10 latency benchmark (synthetic 5,000-document vault, ~17 min); needs the same models. It prints a table and asserts nothing.
 
 ## Release

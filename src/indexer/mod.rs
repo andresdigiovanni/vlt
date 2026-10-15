@@ -271,7 +271,7 @@ mod tests {
     use std::{fs, time::Duration};
     use tempfile::tempdir;
 
-    fn meta() -> IndexMeta { IndexMeta { model_id: "fake".into(), dim: 384, vault: "/v".into() } }
+    fn meta() -> IndexMeta { IndexMeta { model_id: "fake".into(), dim: 384, fingerprint: "fake".into(), vault: "/v".into() } }
     fn no_progress() -> impl FnMut(usize, usize) { |_, _| {} }
     fn count(c: &Connection, sql: &str) -> i64 { c.query_row(sql, [], |r| r.get(0)).unwrap() }
 

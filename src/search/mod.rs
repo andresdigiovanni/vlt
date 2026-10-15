@@ -6,7 +6,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{Map, Value};
 
 use crate::config::SearchConfig;
-use crate::ml::{Embedder, Reranker, QUERY_PREFIX};
+use crate::ml::{Embedder, Reranker};
 use crate::storage::db::f32_blob;
 use crate::{Result, VltError};
 use filter::Filter;
@@ -117,8 +117,7 @@ fn bm25_ids(conn: &Connection, query: &str, filtered: bool, k: usize) -> Result<
 }
 
 fn vector_ids(conn: &Connection, embedder: &dyn Embedder, query: &str, filtered: bool, k: usize) -> Result<Vec<i64>> {
-    let text = format!("{QUERY_PREFIX}{query}");
-    let vector = embedder.embed(&[text.as_str()])?.into_iter().next().ok_or_else(|| VltError::Internal("the embedder returned no vector".into()))?;
+    let vector = embedder.embed_query(query)?;
     let restrict = if filtered { format!(" WHERE ch.path IN ({FILTER_CLAUSE})") } else { String::new() };
     let sql = format!(
         "SELECT ch.id FROM chunk_vectors v JOIN chunks ch ON ch.id = v.chunk_rowid{restrict} ORDER BY vec_distance_cosine(v.embedding, ?1) LIMIT ?2"
@@ -250,7 +249,7 @@ mod tests {
         fs::create_dir_all(v.join("projects")).unwrap();
         fs::write(v.join("projects/db.md"), "---\ntags: [rust, db]\nstatus: in_progress\n---\n# Storage\n\n## Concurrency\nSQLite WAL mode allows concurrent readers.\n\n## Backups\nCopy the file nightly.\n").unwrap();
         fs::write(v.join("notes.md"), "---\ntags: [cooking]\n---\n# Pasta\n\nBoil water with salt.\n").unwrap();
-        let mut db = Db::open(&d.path().join("vlt.db"), &IndexMeta { model_id: "fake".into(), dim: 384, vault: "v".into() }).unwrap();
+        let mut db = Db::open(&d.path().join("vlt.db"), &IndexMeta { model_id: "fake".into(), dim: 384, fingerprint: "fake".into(), vault: "v".into() }).unwrap();
         let src = || -> crate::Result<Arc<dyn crate::ml::Embedder>> { Ok(Arc::new(FakeEmbedder)) };
         reindex(db.conn_mut(), &v, &build_exclude(&[]).unwrap(), &src, &mut |_, _| {}).unwrap();
         (d, db)
@@ -295,7 +294,7 @@ mod tests {
         assert_eq!(top.content, "SQLite WAL mode allows concurrent readers.");
         assert_eq!(top.document.title, "Storage");
         assert_eq!(top.document.properties["status"], json!("in_progress"));
-        assert!(top.score >= 0.3 && top.score <= 1.0);
+        assert!(top.score >= SearchConfig::default().min_score && top.score <= 1.0);
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["results"][0]["document"]["path"], json!("projects/db.md"));
     }
@@ -355,6 +354,10 @@ mod tests {
         fn embed(&self, texts: &[&str]) -> crate::Result<Vec<Vec<f32>>> {
             self.seen.lock().unwrap().extend(texts.iter().map(|t| t.to_string()));
             Ok(texts.iter().map(|_| self.vector.clone()).collect())
+        }
+        fn embed_query(&self, query: &str) -> crate::Result<Vec<f32>> {
+            self.seen.lock().unwrap().push(format!("query:{query}"));
+            Ok(self.vector.clone())
         }
         fn count_tokens(&self, text: &str) -> usize { text.split_whitespace().count() }
     }
@@ -427,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn both_branches_contribute_and_only_the_vector_branch_gets_the_prefix() {
+    fn both_branches_contribute_and_the_vector_branch_embeds_the_query_as_a_query() {
         let (_d, db) = setup();
         let pasta = fts_text_of(&db, "notes.md#Pasta");
         let backups = fts_text_of(&db, "projects/db.md#Backups");
@@ -440,7 +443,7 @@ mod tests {
         let mut want = vec![backups, pasta];
         want.sort();
         assert_eq!(docs, want, "BM25 top-1 is Backups, vector top-1 is Pasta");
-        assert_eq!(*embedder.seen.lock().unwrap(), vec![format!("{QUERY_PREFIX}copy nightly wal")]);
+        assert_eq!(*embedder.seen.lock().unwrap(), vec!["query:copy nightly wal"], "the model's query prompt applies");
     }
 
     /// 30 files under `a/` and `b/`, every third tagged `x`; several share identical text, so BM25 ties.
@@ -460,7 +463,7 @@ mod tests {
             };
             fs::write(v.join(format!("{dir}/n{i:02}.md")), format!("---\ntags: {tags}\n---\n{body}\n")).unwrap();
         }
-        let mut db = Db::open(&d.path().join("vlt.db"), &IndexMeta { model_id: "fake".into(), dim: 384, vault: "v".into() }).unwrap();
+        let mut db = Db::open(&d.path().join("vlt.db"), &IndexMeta { model_id: "fake".into(), dim: 384, fingerprint: "fake".into(), vault: "v".into() }).unwrap();
         let src = || -> crate::Result<Arc<dyn crate::ml::Embedder>> { Ok(Arc::new(FakeEmbedder)) };
         reindex(db.conn_mut(), &v, &build_exclude(&[]).unwrap(), &src, &mut |_, _| {}).unwrap();
         (d, db)

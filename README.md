@@ -31,7 +31,7 @@ vlt fixes all three:
 - **Hybrid search**: keyword search (SQLite FTS5) and semantic search (sqlite-vec) over the sections of every note, fused with Reciprocal Rank Fusion and reranked by a local cross-encoder. Results below a relevance threshold are dropped, so "nothing relevant" is an answer, not five random hits.
 - **Filters**: by frontmatter property (`status=in_progress`, `tags=rust`, `date>=2026-01-01`) and by folder.
 - **Enrichment on request**: ask the agent to "process the note X" and it proposes properties that match your vault's vocabulary, links from and to related notes, and fixes for broken links. It writes only the changes you pick.
-- **Local models**: embeddings and reranking run on your CPU with [Candle](https://github.com/huggingface/candle). Models are downloaded once and checked against built-in SHA256 hashes; vlt works offline afterwards.
+- **Local models**: embeddings and reranking run on your CPU with [Candle](https://github.com/huggingface/candle). Pick any Hugging Face model of a [supported architecture](#models). Models are downloaded once, checked against the hashes Hugging Face publishes, and locked to that commit; vlt works offline afterwards.
 
 ## Quick start
 
@@ -52,7 +52,7 @@ vlt install
 `vlt install`:
 
 1. asks for the path of your vault (and offers to create it if it does not exist),
-2. downloads the embedding and reranking models to `~/.vlt/models/` (~220 MB),
+2. downloads the embedding and reranking models to `~/.vlt/models/` (~1.5 GB),
 3. registers the MCP server and installs the vlt Skill for each agent you pick (Claude Code, opencode, Codex),
 4. writes `~/.vlt/config.toml` with default values,
 5. indexes the vault.
@@ -221,23 +221,51 @@ vault = "/path/to/vault"
 exclude = []
 
 [models]
-embedding = "BAAI/bge-small-en-v1.5"                 # 384 dimensions, ~130 MB
-reranker  = "cross-encoder/ms-marco-MiniLM-L-6-v2"   # ~90 MB
+embedding = "Qwen/Qwen3-Embedding-0.6B"             # 1024 dimensions, ~1.2 GB
+reranker  = "mixedbread-ai/mxbai-rerank-base-v1"    # ~350 MB
 idle_unload_secs = 300                               # unload the models after 5 min without use
+
+# Optional overrides of what the model repos declare:
+# [models.embedding_options]
+# revision = "main"              # branch, tag or commit to download
+# pooling = "cls"                # cls, mean or last
+# query_prefix = "query: "       # prepended to search queries
+# document_prefix = "passage: "  # prepended to indexed text
+# precision = "f32"              # f32 or f16 (default: f16 for 16-bit weights, else f32)
+# [models.reranker_options]
+# revision = "main"
+# precision = "f32"
 
 [search]
 k = 50            # candidates per branch (BM25 and vectors)
 rrf_k = 60        # Reciprocal Rank Fusion constant
-rerank_top = 20   # candidates passed to the reranker
+rerank_top = 10   # candidates passed to the reranker; each one costs reranking time
 limit = 5         # results returned by default
-min_score = 0.3   # reranker threshold [0, 1]; calibrate with real documents
+min_score = 0.05  # reranker threshold [0, 1]; depends on the reranker, calibrate with real documents
 ```
 
 Changing `exclude` does not require a rebuild: the next incremental reindex drops the newly excluded paths and indexes the ones that are no longer excluded.
 
 Changing `vault` or a model makes the existing index unusable: searches then fail with a message asking for a rebuild. Run `vlt reindex` to rebuild it (it takes a while on a large vault).
 
-The default models are English. Notes in other languages are indexed, but search quality drops.
+The default embedding model is multilingual; the default reranker was trained on English, so notes in other languages are found but ranked less precisely.
+
+### Models
+
+`embedding` and `reranker` take any Hugging Face repo id (`<owner>/<name>`) whose architecture vlt can run:
+
+| Role | Architectures (`model_type` in the repo's `config.json`) | Examples |
+|---|---|---|
+| `embedding` | `bert`, `xlm-roberta`, `qwen3` | `BAAI/bge-small-en-v1.5`, `BAAI/bge-large-en-v1.5`, `Qwen/Qwen3-Embedding-0.6B` |
+| `reranker` | `bert`, `xlm-roberta`, `deberta-v2` cross-encoders with one output (`*ForSequenceClassification`) | `cross-encoder/ms-marco-MiniLM-L-6-v2`, `BAAI/bge-reranker-base`, `mixedbread-ai/mxbai-rerank-base-v1`, `mixedbread-ai/mxbai-rerank-large-v1` |
+
+The repo must ship `config.json`, `tokenizer.json` and safetensors weights (`model.safetensors`, or shards listed in `model.safetensors.index.json`). vlt reads everything else from the repo's sentence-transformers files: the pooling (`1_Pooling/config.json`), the query and document prompts (`config_sentence_transformers.json`) and the maximum length (`sentence_bert_config.json`, capped at 512 tokens). Set a key under `[models.embedding_options]` when the repo does not declare it or you want another value. A repo without pooling settings gets mean pooling (last-token for `qwen3`); the English BGE models get their documented query instruction.
+
+Models compute in the precision their weights are stored in: 16-bit weights (F16, or BF16, which Candle cannot multiply on a CPU and so runs as F16) use half the memory of F32 and run faster on CPUs with native F16. `deberta-v2` rerankers always run in F32, since Candle's implementation builds F32 masks. Set `precision = "f32"` to trade memory for the exact F32 result.
+
+`vlt reindex` (and `vlt install`) downloads a model the first time it is configured, at the revision set in the options (`main` by default). vlt checks each file against the hash Hugging Face publishes for that commit and records the commit and hashes in `vlt-lock.json` in the model's folder. From then on the model stays at that commit, even if the repo changes; set another `revision` to move it. An unsupported model is reported right after its download, with the reason. Private and gated repos are not supported.
+
+Model size sets speed and memory on a CPU, and the reranker dominates both: it reads every candidate in full. Measured on an Apple M-series CPU, reranking 10 sections of ~290 tokens (the default `rerank_top`) takes about 5 s with `mixedbread-ai/mxbai-rerank-base-v1` (the default), 15 s with `mixedbread-ai/mxbai-rerank-large-v1`, 2.3 s with `mixedbread-ai/mxbai-rerank-xsmall-v1` and 0.8 s with `cross-encoder/ms-marco-MiniLM-L-6-v2`; time grows in proportion to `rerank_top` and to section length. With the defaults vlt peaks at about 2.3 GB of memory; `BAAI/bge-small-en-v1.5` with `cross-encoder/ms-marco-MiniLM-L-6-v2` (the defaults of vlt 0.1.0) need about 350 MB.
 
 ## Where everything lives
 

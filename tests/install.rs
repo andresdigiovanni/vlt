@@ -77,7 +77,7 @@ fn changing_the_vault_rewrites_only_the_vault_key() {
     assert_eq!(vlt::config::Config::load(&cfg_path).unwrap().vault, b);
     // fails until the index is rebuilt for the new vault
     fs::write(b.join("zebra.md"), "# Zebra\n\nStripes and savanna.\n").unwrap();
-    fs::write(&cfg_path, fs::read_to_string(&cfg_path).unwrap().replace("min_score = 0.3 ", "min_score = 0 ")).unwrap();
+    fs::write(&cfg_path, fs::read_to_string(&cfg_path).unwrap().replace("min_score = 0.05 ", "min_score = 0 ")).unwrap();
     let out = cmd(home).args(["search", "zebra stripes", "--json"]).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
@@ -139,16 +139,16 @@ fn uninstall_keeps_other_mcp_servers() {
 }
 
 #[test]
-fn unsupported_model_in_config_fails_before_creating_the_vault() {
+fn malformed_model_id_in_config_fails_before_creating_the_vault() {
     let d = tempfile::tempdir().unwrap();
     let home = d.path();
     fs::create_dir_all(home.join(".vlt")).unwrap();
-    let text = vlt::config::Config::default_toml(&home.join("old")).replace("BAAI/bge-small-en-v1.5", "nope/model");
+    let text = vlt::config::Config::default_toml(&home.join("old")).replace("Qwen/Qwen3-Embedding-0.6B", "nope");
     fs::write(home.join(".vlt/config.toml"), text).unwrap();
     let vault = home.join("new vault");
     let out = install(home, &["--vault", vault.to_str().unwrap(), "--yes", "--target", "claude"]);
     assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("unsupported model"), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("invalid model id `nope`"), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(!vault.exists(), "no vault created");
     assert!(!home.join(".claude.json").exists(), "no agent configured");
 }

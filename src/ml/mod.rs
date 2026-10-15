@@ -3,14 +3,18 @@ use crate::Result;
 pub mod embeddings;
 pub mod fake;
 pub mod models;
-pub mod registry;
+pub mod profile;
 pub mod reranker;
 
-pub const QUERY_PREFIX: &str = "Represent this sentence for searching relevant passages: ";
-
 pub trait Embedder: Send + Sync {
-    /// L2-normalized vectors, one per input text.
+    /// L2-normalized vectors, one per indexed text.
     fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
+    /// L2-normalized vector of a search query, with the model's query prompt applied.
+    fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
+        self.embed(&[query])?
+            .pop()
+            .ok_or_else(|| crate::VltError::Internal("the embedder returned no vector".into()))
+    }
     /// Token count including special tokens.
     fn count_tokens(&self, text: &str) -> usize;
 }

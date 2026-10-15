@@ -61,7 +61,7 @@ impl App {
             return Ok(ReindexOutcome { stats: ReindexStats::default(), reindexed: false });
         };
         let mut db = Db::open_unchecked(&self.db_path())?;
-        let meta = self.models.index_meta(&self.cfg.vault);
+        let meta = self.models.index_meta(&self.cfg.vault)?;
         let source = || self.models.embedder();
         let stats = if force || !index_matches(&db, &meta)? {
             indexer::rebuild(db.conn_mut(), &meta, &self.cfg.vault, &self.exclude, &source, progress)?
@@ -77,7 +77,7 @@ impl App {
         let Some(_lock) = self.lock()? else {
             return Ok(ReindexOutcome { stats: ReindexStats::default(), reindexed: false });
         };
-        let mut db = Db::open(&self.db_path(), &self.models.index_meta(&self.cfg.vault))?;
+        let mut db = Db::open(&self.db_path(), &self.models.index_meta(&self.cfg.vault)?)?;
         let source = || self.models.embedder();
         let stats = indexer::reindex(db.conn_mut(), &self.cfg.vault, &self.exclude, &source, &mut |_, _| {})?;
         Ok(ReindexOutcome { stats, reindexed: true })
@@ -86,7 +86,7 @@ impl App {
     /// Opens the index for a read tool, running an incremental reindex first when the lock is free.
     fn open_for_read(&self) -> Result<Db> {
         let path = self.db_path();
-        let meta = self.models.index_meta(&self.cfg.vault);
+        let meta = self.models.index_meta(&self.cfg.vault)?;
         match self.lock()? {
             Some(_lock) => {
                 let mut db = Db::open(&path, &meta)?;

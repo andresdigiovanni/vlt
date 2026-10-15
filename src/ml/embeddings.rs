@@ -1,22 +1,38 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::models::bert::{BertModel, Config};
+use candle_transformers::models::bert::{self, BertModel};
+use candle_transformers::models::qwen3;
+use candle_transformers::models::xlm_roberta::{self, XLMRobertaModel};
 use tokenizers::{PaddingParams, Tokenizer, TruncationParams};
 
+use crate::ml::profile::{EmbeddingArch, EmbeddingProfile, Pooling};
+#[cfg(test)]
+use crate::ml::profile::Precision;
 use crate::ml::Embedder;
 use crate::{Result, VltError};
 
-const MAX_TOKENS: usize = 512;
 /// At most this many texts per forward pass.
 const BATCH: usize = 32;
 /// At most this many padded tokens per forward pass, bounding activation memory.
 const BATCH_TOKENS: usize = 768;
 
-pub struct BertEmbedder {
-    model: BertModel,
-    /// Truncating, not padding: each batch is padded to its own longest text.
+enum Backbone {
+    Bert(BertModel),
+    XlmRoberta(XLMRobertaModel),
+    /// Causal: a token only attends to those before it, so right padding never reaches the
+    /// text and needs no mask. Cloned for each forward, since the model keeps a KV cache that
+    /// must start empty; the clone shares the weights.
+    Qwen3(qwen3::Model),
+}
+
+pub struct TextEmbedder {
+    backbone: Backbone,
+    pooling: Pooling,
+    query_prefix: String,
+    document_prefix: String,
+    /// Truncating, not padding: each batch is padded on the right to its own longest text.
     tokenizer: Tokenizer,
     padding: PaddingParams,
     counter: Tokenizer,
@@ -34,10 +50,23 @@ pub(crate) fn load_config<T: serde::de::DeserializeOwned>(dir: &Path) -> Result<
     serde_json::from_str(&text).map_err(|e| invalid(&e))
 }
 
-pub(crate) fn load_weights(dir: &Path, device: &Device) -> Result<VarBuilder<'static>> {
-    // SAFETY: the file is owned by vlt and not modified while mapped.
-    unsafe { VarBuilder::from_mmaped_safetensors(&[dir.join("model.safetensors")], DType::F32, device) }
-        .map_err(model_err)
+/// The weights converted to `dtype` as they load.
+pub(crate) fn load_weights(files: &[PathBuf], dtype: DType, device: &Device) -> Result<VarBuilder<'static>> {
+    if files.is_empty() {
+        return Err(VltError::Model("the model has no weights; run `vlt reindex`".into()));
+    }
+    // SAFETY: the files are owned by vlt and not modified while mapped.
+    unsafe { VarBuilder::from_mmaped_safetensors(files, dtype, device) }.map_err(model_err)
+}
+
+/// `vb` under `prefix` when the weights were saved from a task model (`bert.encoder…` rather
+/// than `encoder…`); `probe` is a tensor the base model always has.
+pub(crate) fn base_model(vb: VarBuilder<'static>, prefix: &str, probe: &str) -> VarBuilder<'static> {
+    if !vb.contains_tensor(probe) && vb.pp(prefix).contains_tensor(probe) {
+        vb.pp(prefix)
+    } else {
+        vb
+    }
 }
 
 /// Batch-longest right padding with the tokenizer's own pad token.
@@ -113,36 +142,93 @@ pub(crate) fn batch_tensors(encodings: &[tokenizers::Encoding], device: &Device)
     ))
 }
 
-impl BertEmbedder {
-    pub fn load(dir: &Path) -> Result<BertEmbedder> {
-        let device = Device::Cpu;
-        let config: Config = load_config(dir)?;
-        let vb = load_weights(dir, &device)?;
-        let model = BertModel::load(vb, &config).map_err(model_err)?;
-        let trunc = TruncationParams { max_length: MAX_TOKENS, ..Default::default() };
-        let (mut tokenizer, counter) = load_tokenizer(dir, trunc)?;
-        let padding = tokenizer.get_padding().cloned().unwrap_or_default();
-        tokenizer.with_padding(None);
-        Ok(BertEmbedder { model, tokenizer, padding, counter, device })
-    }
-
-    fn embed_batch(&self, mut encodings: Vec<tokenizers::Encoding>) -> Result<Vec<Vec<f32>>> {
-        tokenizers::pad_encodings(&mut encodings, &self.padding).map_err(model_err)?;
-        let (ids, types, mask) = batch_tensors(&encodings, &self.device)?;
-        let hidden = self.model.forward(&ids, &types, Some(&mask)).map_err(model_err)?;
-        let cls = hidden.narrow(1, 0, 1).and_then(|t| t.squeeze(1)).map_err(model_err)?;
-        let norm = cls
-            .sqr()
-            .and_then(|t| t.sum_keepdim(1))
-            .and_then(|t| t.sqrt())
-            .and_then(|t| t.clamp(1e-12f32, f32::MAX))
-            .map_err(model_err)?;
-        cls.broadcast_div(&norm).and_then(|t| t.to_vec2::<f32>()).map_err(model_err)
+/// One vector per row of `hidden` (batch, seq, dim): `lens` real tokens each, padding after.
+fn pool(pooling: Pooling, hidden: &Tensor, mask: &Tensor, lens: &[usize]) -> candle_core::Result<Tensor> {
+    match pooling {
+        Pooling::Cls => hidden.narrow(1, 0, 1)?.squeeze(1),
+        Pooling::Mean => {
+            let mask = mask.to_dtype(DType::F32)?.unsqueeze(2)?;
+            let sum = hidden.broadcast_mul(&mask)?.sum(1)?;
+            sum.broadcast_div(&mask.sum(1)?.clamp(1f32, f32::MAX)?)
+        }
+        Pooling::Last => {
+            let rows = lens
+                .iter()
+                .enumerate()
+                .map(|(i, &len)| hidden.get(i)?.get(len.saturating_sub(1)))
+                .collect::<candle_core::Result<Vec<_>>>()?;
+            Tensor::stack(&rows, 0)
+        }
     }
 }
 
-impl Embedder for BertEmbedder {
-    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+fn l2_normalize(v: &Tensor) -> candle_core::Result<Tensor> {
+    let norm = v.sqr()?.sum_keepdim(1)?.sqrt()?.clamp(1e-12f32, f32::MAX)?;
+    v.broadcast_div(&norm)
+}
+
+impl TextEmbedder {
+    pub fn load(dir: &Path, profile: &EmbeddingProfile) -> Result<TextEmbedder> {
+        let device = Device::Cpu;
+        let vb = load_weights(&profile.weights, profile.precision.dtype(), &device)?;
+        let backbone = match profile.arch {
+            EmbeddingArch::Bert => {
+                let cfg: bert::Config = load_config(dir)?;
+                let vb = base_model(vb, "bert", "embeddings.word_embeddings.weight");
+                Backbone::Bert(BertModel::load(vb, &cfg).map_err(model_err)?)
+            }
+            EmbeddingArch::XlmRoberta => {
+                let cfg: xlm_roberta::Config = load_config(dir)?;
+                let vb = base_model(vb, "roberta", "embeddings.word_embeddings.weight");
+                Backbone::XlmRoberta(XLMRobertaModel::new(&cfg, vb).map_err(model_err)?)
+            }
+            EmbeddingArch::Qwen3 => {
+                let cfg: qwen3::Config = load_config(dir)?;
+                // Candle names the tensors as the causal LM does (`model.layers…`); embedding
+                // repos save the bare model (`layers…`).
+                let vb = if vb.contains_tensor("model.embed_tokens.weight") {
+                    vb
+                } else {
+                    vb.rename_f(|name| name.strip_prefix("model.").unwrap_or(name).to_string())
+                };
+                Backbone::Qwen3(qwen3::Model::new(&cfg, vb).map_err(model_err)?)
+            }
+        };
+        let trunc = TruncationParams { max_length: profile.max_tokens, ..Default::default() };
+        let (mut tokenizer, counter) = load_tokenizer(dir, trunc)?;
+        let padding = tokenizer.get_padding().cloned().unwrap_or_default();
+        tokenizer.with_padding(None);
+        Ok(TextEmbedder {
+            backbone,
+            pooling: profile.pooling,
+            query_prefix: profile.query_prefix.clone(),
+            document_prefix: profile.document_prefix.clone(),
+            tokenizer,
+            padding,
+            counter,
+            device,
+        })
+    }
+
+    fn embed_batch(&self, mut encodings: Vec<tokenizers::Encoding>) -> Result<Vec<Vec<f32>>> {
+        let lens: Vec<usize> = encodings.iter().map(|e| e.len()).collect();
+        tokenizers::pad_encodings(&mut encodings, &self.padding).map_err(model_err)?;
+        let (ids, types, mask) = batch_tensors(&encodings, &self.device)?;
+        let hidden = match &self.backbone {
+            Backbone::Bert(m) => m.forward(&ids, &types, Some(&mask)),
+            Backbone::XlmRoberta(m) => m.forward(&ids, &mask, &types, None, None, None),
+            Backbone::Qwen3(m) => m.clone().forward(&ids, 0),
+        };
+        // Pooled and normalized in F32 whatever the model computes in.
+        hidden
+            .and_then(|h| h.to_dtype(DType::F32))
+            .and_then(|h| pool(self.pooling, &h, &mask, &lens))
+            .and_then(|v| l2_normalize(&v))
+            .and_then(|v| v.to_vec2::<f32>())
+            .map_err(model_err)
+    }
+
+    fn embed_raw(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         let encodings = self.tokenizer.encode_batch(texts.to_vec(), true).map_err(model_err)?;
         let lens: Vec<usize> = encodings.iter().map(|e| e.len()).collect();
         let mut encodings: Vec<Option<tokenizers::Encoding>> = encodings.into_iter().map(Some).collect();
@@ -150,8 +236,27 @@ impl Embedder for BertEmbedder {
             self.embed_batch(batch.iter().filter_map(|&i| encodings[i].take()).collect())
         })
     }
+}
 
+impl Embedder for TextEmbedder {
+    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        if self.document_prefix.is_empty() {
+            return self.embed_raw(texts);
+        }
+        let prefixed: Vec<String> = texts.iter().map(|t| format!("{}{t}", self.document_prefix)).collect();
+        self.embed_raw(&prefixed.iter().map(String::as_str).collect::<Vec<_>>())
+    }
+
+    fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
+        let text = format!("{}{query}", self.query_prefix);
+        self.embed_raw(&[&text])?
+            .pop()
+            .ok_or_else(|| VltError::Internal("the embedder returned no vector".into()))
+    }
+
+    /// Counts the document prefix too, so a chunk cut to fit still fits once prefixed.
     fn count_tokens(&self, text: &str) -> usize {
+        let text = format!("{}{text}", self.document_prefix);
         self.counter.encode(text, true).map(|e| e.len()).unwrap_or(0)
     }
 }
@@ -243,9 +348,36 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn missing_config_is_a_model_error() {
+    fn missing_config_or_weights_is_a_model_error() {
         let d = tempfile::tempdir().unwrap();
-        assert!(matches!(load_config::<Config>(d.path()), Err(VltError::Model(_))));
-        assert!(matches!(BertEmbedder::load(d.path()), Err(VltError::Model(_))));
+        assert!(matches!(load_config::<bert::Config>(d.path()), Err(VltError::Model(_))));
+        let profile = EmbeddingProfile {
+            arch: EmbeddingArch::Bert,
+            dim: 8,
+            pooling: Pooling::Cls,
+            query_prefix: String::new(),
+            document_prefix: String::new(),
+            max_tokens: 512,
+            commit: "c".into(),
+            weights: vec![d.path().join("model.safetensors")],
+            precision: Precision::F32,
+        };
+        assert!(matches!(TextEmbedder::load(d.path(), &profile), Err(VltError::Model(_))));
+        let no_weights = EmbeddingProfile { weights: vec![], ..profile };
+        assert!(matches!(TextEmbedder::load(d.path(), &no_weights), Err(VltError::Model(_))));
+    }
+
+    #[test]
+    fn pooling_picks_the_right_tokens_and_ignores_padding() {
+        // two rows of three tokens; the second row has one real token and two pads
+        let hidden = Tensor::new(&[[[1f32, 0.], [3., 2.], [5., 4.]], [[7., 6.], [9., 9.], [9., 9.]]], &Device::Cpu).unwrap();
+        let mask = Tensor::new(&[[1u32, 1, 1], [1, 0, 0]], &Device::Cpu).unwrap();
+        let lens = [3, 1];
+        let run = |p| pool(p, &hidden, &mask, &lens).unwrap().to_vec2::<f32>().unwrap();
+        assert_eq!(run(Pooling::Cls), vec![vec![1., 0.], vec![7., 6.]]);
+        assert_eq!(run(Pooling::Mean), vec![vec![3., 2.], vec![7., 6.]]);
+        assert_eq!(run(Pooling::Last), vec![vec![5., 4.], vec![7., 6.]]);
+        let unit = l2_normalize(&Tensor::new(&[[3f32, 4.]], &Device::Cpu).unwrap()).unwrap().to_vec2::<f32>().unwrap();
+        assert_eq!(unit, vec![vec![0.6, 0.8]]);
     }
 }

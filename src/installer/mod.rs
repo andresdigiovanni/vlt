@@ -102,15 +102,15 @@ fn ensure_models(vlt_home: &Path, models: &Models) -> Result<()> {
         return Ok(());
     }
     let dir = paths::models_dir(vlt_home);
-    for spec in models.specs() {
-        if !missing(&dir, spec) {
-            say(format_args!("✓ Model {} already downloaded\n", spec.id))?;
+    for model in models.refs() {
+        if !missing(&dir, &model.id, &model.revision) {
+            say(format_args!("✓ Model {} already downloaded\n", model.id))?;
             continue;
         }
-        pull_showing_progress(&dir, spec)?;
-        say(format_args!("✓ Model {} downloaded\n", spec.id))?;
+        pull_showing_progress(&dir, &model.id, &model.revision)?;
+        say(format_args!("✓ Model {} downloaded\n", model.id))?;
     }
-    Ok(())
+    models.check()
 }
 
 fn label(action: &SetupAction) -> &'static str {
