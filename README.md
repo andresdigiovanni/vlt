@@ -30,7 +30,7 @@ flowchart LR
 ```
 
 - **Hybrid search**: keyword search (SQLite FTS5) and semantic search (sqlite-vec) over the sections of every note, the best of each fused with Reciprocal Rank Fusion and reranked by a local cross-encoder. Results below a relevance threshold are dropped, so "nothing relevant" is an answer, not five random hits.
-- **Filters**: by frontmatter property (`status=in_progress`, `tags=rust`, `date>=2026-01-01`) and by folder.
+- **Filters**: by frontmatter property (`status=in_progress`, `tags=rust`, `date>=2026-01-01`) and by folder. A tag also matches its nested tags: `tags=project` finds `project/vlt`.
 - **Enrichment on request**: ask the agent to "process the note X" and it proposes properties that match your vault's vocabulary, links from and to related notes, and fixes for broken links. It writes only the changes you pick.
 - **Local models**: embeddings and reranking run on your CPU with [Candle](https://github.com/huggingface/candle). Pick any Hugging Face model of a [supported architecture](#models). Models are downloaded once, checked against the hashes Hugging Face publishes, and locked to that commit; vlt works offline afterwards.
 
@@ -147,10 +147,11 @@ Without `vlt install` you also need `~/.vlt/config.toml` (see [Configuration](#c
 
 ### With your agent
 
-The agent uses vlt in two flows:
+The agent uses vlt in three flows:
 
 - **Answering.** When you ask what you know or wrote about something, or when the task depends on your notes (one of your projects, a past decision, a convention), the agent searches the vault, reads what it needs and cites the sections it used (`projects/mcp_rust.md#Concurrency`).
 - **Enriching.** When you ask it to process a note, add properties to it or link it, the agent proposes one numbered list: properties, links from the note, links to it from other notes, and repairs for broken links. You pick ("apply 1, 3"), and it writes only those.
+- **Drafting.** When you ask it to write something up as a new note, the agent first searches for a note that already covers it, then drafts the note with the properties and file name its folder uses and links in the prose. vlt doesn't create files: you save it, and the agent offers to link other notes to it.
 
 ```mermaid
 sequenceDiagram
@@ -199,7 +200,7 @@ vlt reindex [--force]
 | `mcp` | Runs the MCP server on stdio (the agent starts it). |
 | `search` | Hybrid search. `--where` filters by property (repeatable), `--path-prefix` restricts to a folder, `--limit` overrides the configured value. |
 | `get` | Shows a document (path relative to the vault): its title, path, properties and content. `--json` adds its sections, outgoing links and backlinks. |
-| `properties` | Lists the frontmatter properties with their inferred type, the number of documents using them and their most frequent values. |
+| `properties` | Lists the frontmatter properties with their inferred type, the number of documents using them and their most frequent values; `--key` shows one property with every value. |
 | `reindex` | Incremental reindex; `--force` rebuilds the index from scratch. Downloads the configured models first if they are missing. |
 
 `--json` prints the same payload the MCP tool returns.
@@ -215,8 +216,8 @@ The server is named `vlt`. It exposes six tools:
 | Tool | Purpose |
 |---|---|
 | `search` | Hybrid search with property filters, reranking and a score threshold. Parameters: `query`, `where`, `path_prefix`, `limit`, `min_score`. |
-| `get` | Full document (`path`) with properties, sections, outgoing links and backlinks. |
-| `properties` | Inventory of the vault's properties (optional `path_prefix`). |
+| `get` | Full document (`path`) with properties, sections, outgoing links (an ambiguous one with its `candidates`) and backlinks. |
+| `properties` | Inventory of the vault's properties (optional `path_prefix`; optional `key` for one property with every value). |
 | `reindex` | Detects changes in the vault and reindexes them incrementally. |
 | `edit` | Replaces one exact fragment of a document's body. Parameters: `path`, `old_text`, `new_text`. |
 | `update_properties` | Adds, changes or removes frontmatter properties of a document, keeping the rest of the file as it is. Parameters: `path`, `set`, `unset`. |

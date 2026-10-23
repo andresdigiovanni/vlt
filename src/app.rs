@@ -149,9 +149,9 @@ impl App {
         documents::get_document(db.conn(), &self.cfg.vault, path)
     }
 
-    pub fn list_properties(&self, path_prefix: Option<&str>) -> Result<PropertiesResponse> {
+    pub fn list_properties(&self, path_prefix: Option<&str>, key: Option<&str>) -> Result<PropertiesResponse> {
         let db = self.open_for_read()?;
-        documents::list_properties(db.conn(), path_prefix)
+        documents::list_properties(db.conn(), path_prefix, key)
     }
 }
 

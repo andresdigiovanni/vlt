@@ -1,6 +1,6 @@
 ---
 name: vlt
-description: Searches and enriches the user's own markdown notes (their vault) through the vlt MCP tools. Use when the user asks what they know or wrote about something ("what do I know about X", "check my notes on X"); when the task depends on something only their notes would hold (one of their projects, a past decision, a personal convention); or when they ask to process the note X, add properties to it, or link it with other notes. Not for general knowledge (language syntax, public APIs), and not to create, move or delete notes.
+description: Searches and enriches the user's own markdown notes (their vault) through the vlt MCP tools. Use when the user asks what they know or wrote about something ("what do I know about X", "check my notes on X"); when the task depends on something only their notes would hold (one of their projects, a past decision, a personal convention); when they ask to process the note X, add properties to it, or link it with other notes; or when they ask you to draft a new note for the vault. Not for general knowledge (language syntax, public APIs), and not to move or delete notes.
 ---
 
 # vlt
@@ -9,7 +9,7 @@ The vault is the user's folder of markdown notes: their projects, decisions and 
 
 - **Touch the vault only through the vlt tools**, never with native file or shell tools: vlt keeps paths inside the vault, preserves the frontmatter format and reindexes after every write.
 - **Write only what the user picked.** `edit` and `update_properties` run only for items the user chose from your numbered list ("apply 1, 3"). Even when the request names the exact change, show it as a one-item list and wait.
-- **vlt never creates, moves or deletes notes.** For something new, propose the content and a path; the user creates the file and can then ask you to process it.
+- **vlt never creates, moves or deletes notes.** For something new, draft the content and a path (Drafting a new note); the user creates the file and can then ask you to process it.
 
 You never need `reindex` in these flows: every read tool picks up outside changes first, and every write reindexes.
 
@@ -22,7 +22,8 @@ You never need `reindex` in these flows: every read tool picks up outside change
 | names a note and asks for properties only | Enriching, group a only |
 | names a note and asks to link it | Enriching, groups b–d |
 | asks for one specific property or link change | Enriching, that change only (skip the searches it does not need) |
-| asks to create, move or delete a note | None: propose content and a path |
+| asks to create a note, or to write something up as a note | Drafting a new note |
+| asks to move or delete a note | None: say vlt cannot, and what the user would do in their editor |
 
 Never start Enriching on your own. While answering, if you notice a missing property, a missing link or an outdated note, say so in one line and offer to process it.
 
@@ -30,7 +31,7 @@ Never start Enriching on your own. While answering, if you notice a missing prop
 
 1. `search` with a short English query of key terms ("sqlite concurrency wal"), not the whole question. Name things by the term a note would use, not by a description of them: "declaration of helsinki", not "the 1964 ethics code for doctors". The notes and models are in English; answer in the user's language.
 2. When the user names a property, value or folder ("my in-progress projects", "notes tagged rust"), call `properties` first and filter with the keys and values it returns, never guessed ones:
-   - `where` scalar: `{"status": "in_progress"}`; on a list property: `{"tags": "rust"}` (contains), `{"tags": ["rust", "mcp"]}` (contains all);
+   - `where` scalar: `{"status": "in_progress"}`; on a list property: `{"tags": "rust"}` (contains), `{"tags": ["rust", "mcp"]}` (contains all); a tag also matches its nested tags: `{"tags": "project"}` finds `project/vlt`;
    - dates and numbers: `{"date": {"gte": "2026-01-01", "lt": "2026-07-01"}}` (`gt`, `gte`, `lt`, `lte`);
    - several keys combine with AND; a folder goes in `path_prefix`, e.g. `"projects/"`.
 3. `get` the document only when the returned section is not enough.
@@ -40,25 +41,38 @@ A section can be on the topic without answering the question: read its `content`
 
 Answering never writes. If notes look outdated or contradict each other, propose the fix as a numbered list.
 
+## Drafting a new note
+
+vlt cannot create files: you draft the note and the user saves it.
+
+1. `search` the topic first. When a note already covers it, propose extending that note instead, as Enriching items, and say which note and why.
+2. Pick the folder where the closest hits live, then `properties({"path_prefix": "<folder>/"})` (no `path_prefix` for the vault root): give the note the keys most of the folder's notes have, with their spellings, types and values (Properties below).
+3. Name the file like its siblings in that folder (case, separators, language), as the hits' `document.path` show.
+4. Write the body in English with ATX headings. Each section is retrieved without the rest of the note: give each heading the name of its topic ("Retry policy", not "Details") and name the subject in its first sentence instead of "it". Put links to the notes your searches returned in the prose, per Links below.
+5. Show the path and the whole file, frontmatter included, in one code block, and wait. The user saves it.
+6. Once the user says it is saved, `get` it and offer Enriching groups c and d: a new note has no backlinks yet, and links to it are what lead other sections to it.
+
 ## Enriching a note
 
 1. `get(X)`: content, properties, links with their `status`, backlinks.
-2. Properties (group a): `properties({})` for the vault's vocabulary and `properties({"path_prefix": "<folder of X>/"})` for what sibling notes use.
-3. Links (groups b, c): `search` once per topic X covers; skip hits from X itself. `document.properties` on the hits also shows real values.
+2. Properties (group a): `properties({})` for the vault's vocabulary and `properties({"path_prefix": "<folder of X>/"})` for what sibling notes use. Propose the keys X lacks that most siblings have: a key whose `documents` is close to that of the folder's most used key.
+3. Links (groups b, c): `search` once per topic X covers, taking the topics from X's headings; skip hits from X itself. For group c, also `search` X's title and each of its `aliases`: sections that name X are where links to it belong. `document.properties` on the hits also shows real values.
 4. Propose ONE list, numbered across groups, in the user's language:
    - **a. Properties of X**: current → proposed.
    - **b. Links from X**: a sentence in X names a topic another note documents.
    - **c. Links to X**: a sentence in another note names what X documents; this is how X gets backlinks.
    - **d. Repairs**: links in X with `status` `broken` or `ambiguous`, and their fix. Include them whenever links are in scope.
 
-   Each item is one change the user can accept alone: the document, the exact change (sentence before → after, quoted as written) and one line of why. Say in one line when a group is empty.
+   Each item is one change the user can accept alone: the document, the exact change (sentence before → after, quoted as written) and one line of why. Say in one line when a group is empty. Order each group strongest first and keep groups a–c to about 10 items in all; when more remain, say how many and offer them. Repairs never count toward that limit.
 5. Wait for the pick ("apply 1, 3", "all", "1 but with tag rust"), then apply exactly those items and check each response's `diff`.
 6. `get(X)` again: every link you wrote has `status` `ok`, every document you linked from is in `backlinks`. Report what was applied in a short list. A link still not `ok`: report it with its candidate paths instead of retrying.
 
 ### Properties
 
 - Reuse the keys and spellings `properties` returns (`in_progress`, not `in progress`) and their type: lists stay lists, dates are ISO 8601 strings, numbers stay numbers.
-- A key no note uses yet is marked as new in the list, with its reason.
+- When a value appears in several spellings (`Rust` and `rust`, `ml` and `machine-learning`), use the one with the most documents and mention the others in one line.
+- `properties` shows each key's 10 most frequent values. Before calling a value new, `properties({"key": "tags"})` lists every value of that key: reuse an existing one, or the closest spelling.
+- A key or value no note uses yet is marked as new in the list, with its reason.
 - `set` only the keys that change. It replaces the whole value: to add a tag, send the current tags plus the new one.
 - Values are strings, numbers, booleans or lists of those. Remove a key with `unset`, never with `null`.
 
@@ -71,7 +85,7 @@ vlt searches by section: a section is retrieved and read without the rest of its
 - **Change as little as possible.** Wrap words that already name the topic: `[[projects/mcp_rust|the MCP server]]`. If no sentence takes the link naturally, skip it and say so; never add a sentence or section just to hold a link.
 - **Format**: the vault-relative path without `.md`, `[[projects/mcp_rust]]`; for a section, `[[projects/mcp_rust#Concurrency]]`, using the heading text from `heading_path`, never a `chunk_id` suffix like ` [2/3]` or ` (2)`. Inserted text is in English; never put a link inside code.
 - **Skip links that already exist** in that section, and check the other direction too: X already links to T when `get(X).links` has an entry whose `resolved` is T's path, and T links to X when T is in `get(X).backlinks`. That only tells you the note links somewhere; a section that mentions the topic without a link still gets one.
-- **Repairs**: `search` for the intended note and propose the full-path form. If you cannot tell which note was meant, ask in the list.
+- **Repairs**: for an `ambiguous` link, its `candidates` are the notes it could mean; for a `broken` one, `search` for the intended note. Propose the full-path form. If you cannot tell which note was meant, ask in the list.
 
 ### Editing
 

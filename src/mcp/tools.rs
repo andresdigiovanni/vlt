@@ -37,6 +37,8 @@ struct GetArgs {
 struct PropertiesArgs {
     /// Only documents whose vault-relative path starts with this prefix.
     path_prefix: Option<String>,
+    /// Only this property, with every value instead of the most frequent ones.
+    key: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -181,15 +183,15 @@ impl VltServer {
     }
 
     #[tool(
-        description = "Inventory of the vault's properties: per key the inferred type, the number of documents using it and its most frequent values. Call it before filtering by, or setting, a property so you reuse the existing keys and values.",
+        description = "Inventory of the vault's properties: per key the inferred type, the number of documents using it and its most frequent values (every value with `key`). Call it before filtering by, or setting, a property so you reuse the existing keys and values.",
         input_schema = input_schema::<PropertiesArgs>()
     )]
     async fn properties(&self, args: JsonObject) -> Result<CallToolResult, ErrorData> {
-        let prefix = match parse_args::<PropertiesArgs>(args) {
-            Ok(a) => a.path_prefix,
+        let a = match parse_args::<PropertiesArgs>(args) {
+            Ok(a) => a,
             Err(e) => return Ok(tool_error(&e)),
         };
-        Ok(self.call(move |app| app.list_properties(prefix.as_deref())).await)
+        Ok(self.call(move |app| app.list_properties(a.path_prefix.as_deref(), a.key.as_deref())).await)
     }
 
     #[tool(description = "Detects changes in the vault (files edited outside vlt) and reindexes them incrementally. Other tools already do this before reading.")]

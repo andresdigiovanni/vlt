@@ -14,7 +14,7 @@ fn the_skill_covers_every_tool_and_error_code() {
 #[test]
 fn the_skill_states_when_to_use_it_and_does_not_claim_the_vault_is_read_only() {
     let (front, _) = SKILL[4..].split_once("\n---\n").unwrap();
-    for trigger in ["add properties", "link", "process the note"] {
+    for trigger in ["add properties", "link", "process the note", "draft a new note"] {
         assert!(front.contains(trigger), "description misses the trigger {trigger:?}");
     }
     assert!(!SKILL.contains("Read-only."), "the old read-only rule is gone");

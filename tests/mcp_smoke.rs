@@ -49,6 +49,7 @@ fn mcp_lists_and_calls_tools() {
     assert_eq!(schema("search")["properties"]["limit"]["minimum"], json!(1), "limit 0 is rejected, so the schema must not advertise it");
     assert_eq!(schema("get")["required"], json!(["path"]));
     assert!(schema("properties")["properties"]["path_prefix"].is_object());
+    assert!(schema("properties")["properties"]["key"].is_object());
     let mut names: Vec<String> = tools
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())

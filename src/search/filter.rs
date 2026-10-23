@@ -74,6 +74,17 @@ fn scalar_eq(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// `prop` is the tag `wanted` or one nested under it (`project` and `project/` match `project/vlt`).
+fn tag_eq(prop: &Value, wanted: &Value) -> bool {
+    match (prop, wanted) {
+        (Value::String(p), Value::String(w)) => {
+            let (p, w) = (p.to_lowercase(), w.trim_end_matches('/').to_lowercase());
+            p.strip_prefix(&w).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        }
+        _ => scalar_eq(prop, wanted),
+    }
+}
+
 fn scalar_cmp(a: &Value, b: &Value) -> Option<Ordering> {
     match (a, b) {
         (Value::String(x), Value::String(y)) => Some(x.as_str().cmp(y.as_str())),
@@ -83,14 +94,15 @@ fn scalar_cmp(a: &Value, b: &Value) -> Option<Ordering> {
 }
 
 impl Cond {
-    fn matches(&self, prop: &Value) -> bool {
+    fn matches(&self, key: &str, prop: &Value) -> bool {
         match self {
             Cond::Contains(wanted) => {
                 let set: &[Value] = match prop {
                     Value::Array(items) => items,
                     single => std::slice::from_ref(single),
                 };
-                wanted.iter().all(|w| set.iter().any(|p| scalar_eq(p, w)))
+                let eq = if key == "tags" { tag_eq } else { scalar_eq };
+                wanted.iter().all(|w| set.iter().any(|p| eq(p, w)))
             }
             Cond::Range(bounds) => {
                 if prop.is_array() {
@@ -134,7 +146,7 @@ impl Filter {
                 return false;
             }
         }
-        self.conds.iter().all(|(key, cond)| properties.and_then(|p| p.get(key)).is_some_and(|v| cond.matches(v)))
+        self.conds.iter().all(|(key, cond)| properties.and_then(|p| p.get(key)).is_some_and(|v| cond.matches(key, v)))
     }
 }
 
@@ -228,6 +240,30 @@ mod tests {
         assert!(!m(json!({"tags": ["rust", "go"]}), p.clone()));
         assert!(m(json!({"tags": "rust"}), json!({"tags": "rust"})), "scalar property matches scalar filter");
         assert!(m(json!({"tags": ["rust"]}), json!({"tags": "rust"})));
+    }
+
+    #[test]
+    fn a_tag_matches_its_nested_tags() {
+        let p = json!({"tags": ["Project/vlt/cli", "area"]});
+        assert!(m(json!({"tags": "project"}), p.clone()));
+        assert!(m(json!({"tags": "project/vlt"}), p.clone()));
+        assert!(m(json!({"tags": "project/vlt/cli"}), p.clone()));
+        assert!(!m(json!({"tags": "proj"}), p.clone()), "a prefix only counts up to a `/`");
+        assert!(!m(json!({"tags": "project/vlt/cli/x"}), p.clone()));
+        assert!(!m(json!({"tags": "area/x"}), p));
+        assert!(m(json!({"tags": "project"}), json!({"tags": "project/vlt"})), "scalar tags property");
+    }
+
+    #[test]
+    fn a_trailing_slash_on_a_tag_filter_is_ignored() {
+        assert!(m(json!({"tags": "project/"}), json!({"tags": ["project/vlt"]})));
+        assert!(m(json!({"tags": "project/"}), json!({"tags": ["project"]})));
+        assert!(!m(json!({"tags": "proj/"}), json!({"tags": ["project/vlt"]})));
+    }
+
+    #[test]
+    fn only_tags_match_nested_values() {
+        assert!(!m(json!({"topics": "project"}), json!({"topics": ["project/vlt"]})));
     }
 
     #[test]

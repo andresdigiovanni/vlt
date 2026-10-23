@@ -65,6 +65,9 @@ pub struct LinkOut {
     pub resolved: Option<String>,
     /// `ok`, `broken` or `ambiguous`.
     pub status: &'static str,
+    /// The paths an `ambiguous` link could mean; empty, and omitted, otherwise.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<String>,
 }
 
 fn internal(e: impl std::fmt::Display) -> VltError {
@@ -119,12 +122,12 @@ pub fn get_document(conn: &Connection, vault: &Path, path: &str) -> Result<Docum
     for row in rows {
         let (target, heading, raw, line, kind) = row?;
         let kind = LinkKind::from_str(&kind).ok_or_else(|| internal(format!("link kind: {kind}")))?;
-        let (resolved, status) = match index.resolve(path, kind, &target, heading.as_deref()) {
-            Resolution::Ok(p) => (Some(p), "ok"),
-            Resolution::Broken => (None, "broken"),
-            Resolution::Ambiguous(_) => (None, "ambiguous"),
+        let (resolved, status, candidates) = match index.resolve(path, kind, &target, heading.as_deref()) {
+            Resolution::Ok(p) => (Some(p), "ok", Vec::new()),
+            Resolution::Broken => (None, "broken", Vec::new()),
+            Resolution::Ambiguous(c) => (None, "ambiguous", c),
         };
-        links.push(LinkOut { raw, line: line as usize, resolved, status });
+        links.push(LinkOut { raw, line: line as usize, resolved, status, candidates });
     }
     let backlinks = index.backlinks(conn, path)?;
 
@@ -202,7 +205,7 @@ impl KeyStats {
     }
 }
 
-pub fn list_properties(conn: &Connection, path_prefix: Option<&str>) -> Result<PropertiesResponse> {
+pub fn list_properties(conn: &Connection, path_prefix: Option<&str>, key: Option<&str>) -> Result<PropertiesResponse> {
     let mut stmt = conn.prepare("SELECT path, properties_json FROM files WHERE properties_json IS NOT NULL")?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
     let mut stats: HashMap<String, KeyStats> = HashMap::new();
@@ -212,8 +215,11 @@ pub fn list_properties(conn: &Connection, path_prefix: Option<&str>) -> Result<P
             continue;
         }
         let props: Map<String, Value> = serde_json::from_str(&json).map_err(internal)?;
-        for (key, value) in props {
-            let s = stats.entry(key).or_default();
+        for (k, value) in props {
+            if key.is_some_and(|key| key != k) {
+                continue;
+            }
+            let s = stats.entry(k).or_default();
             s.documents += 1;
             if let Some(t) = value_type(&value) {
                 s.types.insert(t);
@@ -226,7 +232,7 @@ pub fn list_properties(conn: &Connection, path_prefix: Option<&str>) -> Result<P
     }
     let mut properties: Vec<PropertyInfo> = stats
         .into_iter()
-        .map(|(key, s)| {
+        .map(|(k, s)| {
             let kind = match s.types.len() {
                 0 => "null".to_string(),
                 1 => s.types.iter().next().copied().unwrap_or_default().to_string(),
@@ -237,8 +243,10 @@ pub fn list_properties(conn: &Connection, path_prefix: Option<&str>) -> Result<P
             values.sort_by(|(ja, (a, na)), (jb, (b, nb))| {
                 nb.cmp(na).then_with(|| string_form(a).cmp(&string_form(b))).then_with(|| ja.cmp(jb))
             });
-            let top_values = values.into_iter().take(TOP_VALUES).map(|(_, vn)| vn).collect();
-            PropertyInfo { key, kind, documents: s.documents, top_values }
+            // One key asked for by name gets every value.
+            let top = if key.is_some() { values.len() } else { TOP_VALUES };
+            let top_values = values.into_iter().take(top).map(|(_, vn)| vn).collect();
+            PropertyInfo { key: k, kind, documents: s.documents, top_values }
         })
         .collect();
     properties.sort_by(|a, b| b.documents.cmp(&a.documents).then_with(|| a.key.cmp(&b.key)));
@@ -286,6 +294,21 @@ mod tests {
     }
 
     #[test]
+    fn an_ambiguous_link_lists_its_candidates_and_other_links_do_not() {
+        let d = tempdir().unwrap();
+        let v = d.path().join("vault");
+        for (p, c) in [("a/x.md", "a\n"), ("b/x.md", "b\n"), ("src.md", "[[x]] and [[a/x]].\n")] {
+            let p = v.join(p); fs::create_dir_all(p.parent().unwrap()).unwrap(); fs::write(p, c).unwrap();
+        }
+        let mut db = Db::open(&d.path().join("vlt.db"), &IndexMeta { model_id: "fake".into(), dim: 384, fingerprint: "fake".into(), vault: "v".into() }).unwrap();
+        let src = || -> crate::Result<Arc<dyn crate::ml::Embedder>> { Ok(Arc::new(FakeEmbedder)) };
+        reindex(db.conn_mut(), &v, &build_exclude(&[]).unwrap(), &src, &mut |_, _| {}).unwrap();
+        let links = serde_json::to_value(get_document(db.conn(), &v, "src.md").unwrap()).unwrap()["links"].clone();
+        assert_eq!(links[0], json!({"raw": "[[x]]", "line": 1, "resolved": null, "status": "ambiguous", "candidates": ["a/x.md", "b/x.md"]}));
+        assert_eq!(links[1], json!({"raw": "[[a/x]]", "line": 1, "resolved": "a/x.md", "status": "ok"}));
+    }
+
+    #[test]
     fn a_section_split_into_chunks_is_listed_once_with_its_whole_span() {
         let d = tempdir().unwrap();
         let v = d.path().join("vault");
@@ -323,7 +346,7 @@ mod tests {
     #[test]
     fn list_properties_inventory() {
         let (_d, _v, db) = setup();
-        let r = list_properties(db.conn(), None).unwrap();
+        let r = list_properties(db.conn(), None, None).unwrap();
         let get = |k: &str| r.properties.iter().find(|p| p.key == k).unwrap();
         let keys: Vec<_> = r.properties.iter().map(|p| p.key.as_str()).collect();
         assert_eq!(keys, vec!["tags", "status", "date", "empty", "title"]);
@@ -332,7 +355,7 @@ mod tests {
         assert_eq!(get("status").kind, "mixed");
         assert_eq!(get("date").kind, "date");
         assert_eq!((get("empty").kind.as_str(), get("empty").documents, get("empty").top_values.len()), ("null", 1, 0));
-        let scoped = list_properties(db.conn(), Some("p/")).unwrap();
+        let scoped = list_properties(db.conn(), Some("p/"), None).unwrap();
         assert_eq!(scoped.properties.iter().find(|p| p.key == "tags").unwrap().kind, "list");
     }
 
@@ -352,7 +375,7 @@ mod tests {
         files[0].1 = "---\nk: [v00, zz]\nn:\nd1: 2026-09-30x\nd2: '2026-09-30T10:00'\ns: '3'\n---\n".into();
         files[1].1 = "---\nk: [v01, zz]\nn: hello\ns: 3\n---\n".into();
         let (_d, db) = index(&files);
-        let r = list_properties(db.conn(), None).unwrap();
+        let r = list_properties(db.conn(), None, None).unwrap();
         let get = |k: &str| r.properties.iter().find(|p| p.key == k).unwrap();
         let mut expected = vec![(json!("zz"), 2)];
         expected.extend((0..9).map(|i| (json!(format!("v{i:02}")), 1)));
@@ -363,6 +386,17 @@ mod tests {
         assert_eq!(get("s").kind, "mixed");
         let s_values = &get("s").top_values;
         assert_eq!(*s_values, vec![(json!("3"), 1), (json!(3), 1)], "\"3\" and 3 are distinct; ties on string form order by JSON encoding");
+    }
+
+    #[test]
+    fn list_properties_for_one_key_returns_only_it_with_every_value() {
+        let files: Vec<(String, String)> = (0..12).map(|i| (format!("d/n{i:02}.md"), format!("---\nk: v{i:02}\nother: x\n---\n"))).collect();
+        let (_d, db) = index(&files);
+        let r = list_properties(db.conn(), None, Some("k")).unwrap();
+        assert_eq!(r.properties.iter().map(|p| p.key.as_str()).collect::<Vec<_>>(), vec!["k"]);
+        assert_eq!(r.properties[0].top_values, (0..12).map(|i| (json!(format!("v{i:02}")), 1)).collect::<Vec<_>>());
+        assert!(list_properties(db.conn(), None, Some("missing")).unwrap().properties.is_empty());
+        assert!(list_properties(db.conn(), Some("elsewhere/"), Some("k")).unwrap().properties.is_empty(), "the prefix still applies");
     }
 
     #[test]

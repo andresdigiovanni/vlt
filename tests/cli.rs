@@ -76,9 +76,20 @@ fn get_and_properties() {
     assert_eq!(v["backlinks"][0]["path"], "notes.md");
     let v = e.json(&["properties", "--json"]);
     assert_eq!(v["properties"][0]["key"], "tags");
+    assert_eq!(e.json(&["properties", "--key", "nope", "--json"])["properties"], serde_json::json!([]), "--key limits the inventory to that key");
     let out = e.cmd().args(["get", "nope.md"]).output().unwrap();
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).starts_with("error: document not found"));
+}
+
+#[test]
+fn properties_with_a_key_lists_only_that_key_with_every_value() {
+    let e = Env::new();
+    fs::write(e.vault().join("todo.md"), "---\nstatus: done\n---\n# Todo\n").unwrap();
+    let v = e.json(&["properties", "--key", "tags", "--json"]);
+    assert_eq!(v["properties"].as_array().unwrap().len(), 1, "{v}");
+    assert_eq!(v["properties"][0]["key"], "tags");
+    assert_eq!(v["properties"][0]["top_values"], serde_json::json!([["cooking", 1], ["db", 1], ["rust", 1]]));
 }
 
 #[test]
@@ -349,7 +360,7 @@ fn every_argument_is_documented_in_help() {
     let cases: [(&str, &[&str]); 4] = [
         ("search", &["<QUERY>", "--where <WHERE>", "--path-prefix <PATH_PREFIX>", "--limit <LIMIT>", "--json"]),
         ("get", &["<PATH>", "--json"]),
-        ("properties", &["--path-prefix <PATH_PREFIX>", "--json"]),
+        ("properties", &["--path-prefix <PATH_PREFIX>", "--key <KEY>", "--json"]),
         ("reindex", &["--force"]),
     ];
     for (cmd, entries) in cases {

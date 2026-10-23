@@ -73,6 +73,9 @@ enum Command {
         /// Only documents whose vault-relative path starts with this prefix
         #[arg(long)]
         path_prefix: Option<String>,
+        /// Only this property, with every value instead of the top ones
+        #[arg(long)]
+        key: Option<String>,
         /// Print the same JSON the MCP tool returns
         #[arg(long)]
         json: bool,
@@ -160,9 +163,9 @@ fn dispatch(cmd: Command) -> Result<()> {
                 write_out(format_args!("{}", render_document(&app, &doc)))
             }
         }
-        Command::Properties { path_prefix, json } => {
+        Command::Properties { path_prefix, key, json } => {
             let app = App::load()?;
-            let resp = app.list_properties(path_prefix.as_deref())?;
+            let resp = app.list_properties(path_prefix.as_deref(), key.as_deref())?;
             if json {
                 print_json(&resp)
             } else {

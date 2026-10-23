@@ -7,12 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `get` lists the `candidates` of an ambiguous link: the paths it could mean, so the agent can propose the fix.
+- `properties` takes a `key` (`vlt properties --key tags`) and lists that property alone with every value, not only the 10 most frequent: the agent can check whether a tag already exists before proposing a new one.
+
 ### Changed
 
+- A `tags` filter also matches nested tags, as Obsidian does: `tags=project` (or `tags=project/`) finds notes tagged `project/vlt` or `project/vlt/cli`, not `projects`. Other properties still match exact values.
 - The reranker gets the top half of `rerank_top` from each search branch (vectors take the odd slot), in Reciprocal Rank Fusion order, instead of the RRF top: a section only the semantic branch finds no longer loses its place to sections both branches rank low. On the eval set (`make eval`), Recall@5 rises from 0.826 to 0.878, and from 0.489 to 0.644 on paraphrased questions.
 - `min_score` defaults to 0.02 (was 0.05): on the eval set the default reranker scores some correct answers between 0.02 and 0.05, and no threshold separates relevant from unrelated sections well, so 0.05 cost answers for little filtering: Recall@5 rises from 0.878 to 0.907, while the questions the eval set cannot answer that come back empty drop from 2 of 15 to none. Existing configs keep their value.
 - Notes are indexed in chunks of at most 256 tokens (was 512), and a search result is the whole section a matching chunk belongs to, once per section, scored as its best chunk: smaller chunks rank the sentence that answers, the section keeps its context. On the eval set Recall@5 rises from 0.907 to 0.944, and from 0.722 to 0.833 on paraphrased questions; results carry ~25% more text. The index format changes: run `vlt reindex` once to rebuild it.
 - The Skill tells the agent to search by the term a note would use rather than a description of it, and to check that a section answers the question before using it; the MCP `search` tool's `query` parameter asks for key terms too. On the eval set, the questions rewritten as key-term queries the way the Skill asks reach Recall@5 0.985 (0.944 as asked), and 0.956 on paraphrased questions (0.833).
+- The Skill has a flow for drafting a new note: search for a note that already covers it, use the folder's properties and file names, write headings that stand alone, then offer links to the saved note. When enriching, it also searches the note's title and `aliases` for links to it, proposes the keys most sibling notes have, prefers the most used spelling of a value, and keeps the list to about 10 items.
 - `get` lists each section once, with the `chunk_id` and lines `search` returns for it, instead of one entry per chunk of a long section (`#Heading [1/3]`, `[2/3]`…).
 
 ### Fixed
