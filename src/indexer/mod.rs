@@ -14,7 +14,7 @@ use crate::ml::Embedder;
 use crate::storage::db::{self, ChunkRow, FileRow, IndexMeta};
 use scanner::{sha256_hex, Scan, ScannedFile};
 
-pub const MAX_TOKENS: usize = 512;
+pub const MAX_TOKENS: usize = 256;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ReindexStats {
@@ -98,6 +98,7 @@ fn prepare_many(
             .zip(vectors.by_ref())
             .map(|(c, embedding)| ChunkRow {
                 chunk_id: c.chunk_id,
+                section_id: c.section_id,
                 heading_path: c.heading_path,
                 start_line: c.start_line,
                 end_line: c.end_line,

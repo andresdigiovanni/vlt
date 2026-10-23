@@ -77,7 +77,7 @@ fn changing_the_vault_rewrites_only_the_vault_key() {
     assert_eq!(vlt::config::Config::load(&cfg_path).unwrap().vault, b);
     // fails until the index is rebuilt for the new vault
     fs::write(b.join("zebra.md"), "# Zebra\n\nStripes and savanna.\n").unwrap();
-    fs::write(&cfg_path, fs::read_to_string(&cfg_path).unwrap().replace("min_score = 0.05 ", "min_score = 0 ")).unwrap();
+    fs::write(&cfg_path, fs::read_to_string(&cfg_path).unwrap().replace("min_score = 0.02 ", "min_score = 0 ")).unwrap();
     let out = cmd(home).args(["search", "zebra stripes", "--json"]).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();

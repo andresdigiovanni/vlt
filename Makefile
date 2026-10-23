@@ -7,7 +7,7 @@ CARGO ?= cargo
 	build build-release run \
 	test test-unit test-integration \
 	lint check \
-	bench bench-models bench-latency \
+	bench bench-models bench-latency eval \
 	ci clean
 
 ##@ Help
@@ -55,6 +55,9 @@ bench-models: ## Real-model checks (PASS/FAIL per check, non-zero exit on failur
 
 bench-latency: ## PRD 10 latency benchmark on a synthetic 5,000-document vault (~17 min)
 	$(CARGO) bench --bench latency
+
+eval: ## RAG retrieval quality on eval/corpus, compared with eval/baseline.json (~25 min)
+	$(CARGO) bench --bench eval
 
 ##@ CI and housekeeping
 

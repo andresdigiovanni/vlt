@@ -23,7 +23,7 @@ impl Env {
     }
     fn min_score(&self, score: &str) {
         let path = self.dir.path().join("home/config.toml");
-        let text = fs::read_to_string(&path).unwrap().replace("min_score = 0.05 ", &format!("min_score = {score} "));
+        let text = fs::read_to_string(&path).unwrap().replace("min_score = 0.02 ", &format!("min_score = {score} "));
         fs::write(path, text).unwrap();
     }
     fn cmd(&self) -> Command {

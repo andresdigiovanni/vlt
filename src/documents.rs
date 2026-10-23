@@ -90,16 +90,17 @@ pub fn get_document(conn: &Connection, vault: &Path, path: &str) -> Result<Docum
     let doc = parse(&text, stem);
 
     let mut stmt = conn.prepare(
-        "SELECT chunk_id, heading_path_json, start_line, end_line FROM chunks WHERE path = ?1 ORDER BY start_line, id",
+        "SELECT section_id, heading_path_json, MIN(start_line), MAX(end_line) FROM chunks WHERE path = ?1
+         GROUP BY section_id ORDER BY MIN(start_line), MIN(id)",
     )?;
     let rows = stmt.query_map([path], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?))
     })?;
     let mut sections = Vec::new();
     for row in rows {
-        let (chunk_id, hp, start, end) = row?;
+        let (section_id, hp, start, end) = row?;
         let heading_path = serde_json::from_str(&hp).map_err(internal)?;
-        sections.push(Section { chunk_id, heading_path, lines: [start as usize, end as usize] });
+        sections.push(Section { chunk_id: section_id, heading_path, lines: [start as usize, end as usize] });
     }
 
     let index = LinkIndex::load(conn)?;
@@ -282,6 +283,21 @@ mod tests {
         let links: Vec<_> = doc.links.iter().map(|l| (l.raw.as_str(), l.line, l.resolved.as_deref(), l.status)).collect();
         assert_eq!(links, vec![("[[b]]", 9, Some("b.md"), "ok"), ("[[gone]]", 9, None, "broken")]);
         assert_eq!(doc.backlinks, vec![crate::links::Backlink { path: "b.md".into(), line: 5, raw: "[[a#Part]]".into() }]);
+    }
+
+    #[test]
+    fn a_section_split_into_chunks_is_listed_once_with_its_whole_span() {
+        let d = tempdir().unwrap();
+        let v = d.path().join("vault");
+        fs::create_dir_all(&v).unwrap();
+        let para = (0..200).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" ");
+        fs::write(v.join("long.md"), format!("# Long\n{para}\n\n{para}\n\n{para}\n## Next\nshort\n")).unwrap();
+        let mut db = Db::open(&d.path().join("vlt.db"), &IndexMeta { model_id: "fake".into(), dim: 384, fingerprint: "fake".into(), vault: "v".into() }).unwrap();
+        let src = || -> crate::Result<Arc<dyn crate::ml::Embedder>> { Ok(Arc::new(FakeEmbedder)) };
+        reindex(db.conn_mut(), &v, &build_exclude(&[]).unwrap(), &src, &mut |_, _| {}).unwrap();
+        let doc = get_document(db.conn(), &v, "long.md").unwrap();
+        let secs: Vec<_> = doc.sections.iter().map(|s| (s.chunk_id.as_str(), s.lines)).collect();
+        assert_eq!(secs, vec![("long.md#Long", [1, 6]), ("long.md#Next", [7, 8])]);
     }
 
     #[test]

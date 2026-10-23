@@ -12,6 +12,7 @@ Rust CLI and stdio MCP server (`vlt`, package `vlt`): hybrid semantic search ove
 - `cargo clippy --all-targets -- -D warnings` — must be clean.
 - `cargo build --release --locked` — CI releases build locked; keep `Cargo.lock` in sync when editing `Cargo.toml` (after a version bump: `cargo update -p vlt`).
 - `cargo bench --bench real_models` — the real-model checks (prints PASS/FAIL per check, exits non-zero on a failure). They load the default models (`Qwen/Qwen3-Embedding-0.6B`, `mixedbread-ai/mxbai-rerank-base-v1`), or the Hugging Face repos named by `VLT_BENCH_EMBEDDING` / `VLT_BENCH_RERANKER`, from the models dir of the vlt home (`~/.vlt/models/`, or `$VLT_HOME/models/`), downloading any that is missing. Run them for every architecture a change touches (see README → Models).
+- `cargo bench --bench eval` (`make eval`) — retrieval quality (Recall@5, MRR@5, stage recall…) on `eval/corpus` with `eval/queries.jsonl`, against `eval/baseline.json`; same models as `real_models`, plus `VLT_BENCH_SEARCH='<[search] keys>'` to try search settings. Writes `target/eval/latest.json`; a change that the spec's acceptance rule keeps commits that file as the new `eval/baseline.json`.
 - `cargo bench --bench latency` — the PRD 10 latency benchmark (synthetic 5,000-document vault, ~17 min); needs the same models. It prints a table and asserts nothing.
 
 ## Release

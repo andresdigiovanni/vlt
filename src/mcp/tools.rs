@@ -12,7 +12,7 @@ const INSTRUCTIONS: &str = "vlt: search the user's markdown knowledge base (hybr
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct SearchArgs {
-    /// Free-text query.
+    /// A short English query of key terms ("sqlite concurrency wal"), not the whole question.
     query: String,
     /// Property filter, e.g. {"tags": "rust", "date": {"gte": "2026-01-01"}}.
     #[serde(default, rename = "where")]

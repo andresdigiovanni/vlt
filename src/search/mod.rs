@@ -69,6 +69,25 @@ pub fn rrf(lists: &[Vec<i64>], k: usize) -> Vec<i64> {
     ranked.into_iter().map(|(id, _)| id).collect()
 }
 
+/// The `n` ids to rerank: the top ⌈n/2⌉ of `vector` and top ⌊n/2⌋ of `bm25`, topped up from the RRF
+/// ranking when they overlap or a branch is short, in RRF order. Plain RRF favours ids found by both
+/// branches, so a branch's best id found by it alone could miss the reranker.
+fn rerank_candidates(bm25: &[i64], vector: &[i64], rrf_k: usize, n: usize) -> Vec<i64> {
+    let picked: std::collections::HashSet<i64> = vector.iter().take(n.div_ceil(2)).chain(bm25.iter().take(n / 2)).copied().collect();
+    let mut fill = n.saturating_sub(picked.len());
+    rrf(&[bm25.to_vec(), vector.to_vec()], rrf_k)
+        .into_iter()
+        .filter(|id| {
+            if picked.contains(id) {
+                return true;
+            }
+            let take = fill > 0;
+            fill = fill.saturating_sub(1);
+            take
+        })
+        .collect()
+}
+
 fn parse_properties(raw: Option<String>) -> Result<Option<Map<String, Value>>> {
     raw.map(|s| serde_json::from_str(&s).map_err(|e| VltError::Internal(format!("stored properties are not valid JSON: {e}"))))
         .transpose()
@@ -129,13 +148,14 @@ fn vector_ids(conn: &Connection, embedder: &dyn Embedder, query: &str, filtered:
 
 struct Candidate {
     hit: SearchHit,
+    section_id: String,
     fts_text: String,
 }
 
 fn load_candidate(conn: &Connection, id: i64) -> Result<Option<Candidate>> {
     let row = conn
         .query_row(
-            "SELECT ch.chunk_id, ch.path, ch.heading_path_json, ch.start_line, ch.end_line, ch.content, f.title, f.properties_json, fts.text
+            "SELECT ch.chunk_id, ch.path, ch.heading_path_json, ch.start_line, ch.end_line, ch.content, f.title, f.properties_json, fts.text, ch.section_id
              FROM chunks ch JOIN files f ON f.path = ch.path JOIN chunks_fts fts ON fts.rowid = ch.id
              WHERE ch.id = ?1",
             [id],
@@ -150,11 +170,12 @@ fn load_candidate(conn: &Connection, id: i64) -> Result<Option<Candidate>> {
                     r.get::<_, String>(6)?,
                     r.get::<_, Option<String>>(7)?,
                     r.get::<_, String>(8)?,
+                    r.get::<_, String>(9)?,
                 ))
             },
         )
         .optional()?;
-    let Some((chunk_id, path, heading_json, start, end, content, title, props, fts_text)) = row else { return Ok(None) };
+    let Some((chunk_id, path, heading_json, start, end, content, title, props, fts_text, section_id)) = row else { return Ok(None) };
     let heading_path: Vec<String> = serde_json::from_str(&heading_json)
         .map_err(|e| VltError::Internal(format!("stored heading path is not valid JSON: {e}")))?;
     Ok(Some(Candidate {
@@ -166,12 +187,57 @@ fn load_candidate(conn: &Connection, id: i64) -> Result<Option<Candidate>> {
             content,
             document: DocumentRef { path, title, properties: parse_properties(props)?.unwrap_or_default() },
         },
+        section_id,
         fts_text,
     }))
 }
 
-/// Hybrid search (PRD 4): filters → BM25 + vectors → RRF → reranker → threshold → limit.
+/// One chunk as a pipeline stage saw it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TracedChunk { pub chunk_id: String, pub path: String, pub content: String }
+
+impl TracedChunk {
+    fn of(hit: &SearchHit) -> Self {
+        TracedChunk { chunk_id: hit.chunk_id.clone(), path: hit.document.path.clone(), content: hit.content.clone() }
+    }
+}
+
+/// What each stage of a search produced.
+#[derive(Debug, Default)]
+pub struct SearchTrace {
+    /// BM25 branch, best first, up to `cfg.k`.
+    pub bm25: Vec<TracedChunk>,
+    /// Vector branch, best first, up to `cfg.k`.
+    pub vector: Vec<TracedChunk>,
+    /// What the reranker received: RRF order, up to `cfg.rerank_top`.
+    pub fused: Vec<TracedChunk>,
+    /// `fused` scored by the reranker, best first, before `min_score` and `limit`.
+    pub reranked: Vec<(TracedChunk, f64)>,
+}
+
+fn traced(conn: &Connection, ids: &[i64]) -> Result<Vec<TracedChunk>> {
+    let mut out = Vec::new();
+    for id in ids {
+        if let Some(c) = load_candidate(conn, *id)? {
+            out.push(TracedChunk::of(&c.hit));
+        }
+    }
+    Ok(out)
+}
+
+/// Hybrid search (PRD 4): filters → BM25 + vectors → each branch's top, in RRF order → reranker → threshold → limit.
 pub fn search(conn: &Connection, cfg: &SearchConfig, embedder: &dyn Embedder, reranker: &dyn Reranker, req: &SearchRequest) -> Result<SearchResponse> {
+    run(conn, cfg, embedder, reranker, req, None)
+}
+
+/// `search` plus what each stage produced, for the eval bench.
+pub fn search_traced(conn: &Connection, cfg: &SearchConfig, embedder: &dyn Embedder, reranker: &dyn Reranker, req: &SearchRequest) -> Result<(SearchResponse, SearchTrace)> {
+    let mut trace = SearchTrace::default();
+    let response = run(conn, cfg, embedder, reranker, req, Some(&mut trace))?;
+    Ok((response, trace))
+}
+
+fn run(conn: &Connection, cfg: &SearchConfig, embedder: &dyn Embedder, reranker: &dyn Reranker, req: &SearchRequest, mut trace: Option<&mut SearchTrace>) -> Result<SearchResponse> {
     let empty = || Ok(SearchResponse { results: Vec::new() });
     if req.query.trim().is_empty() {
         return Err(VltError::InvalidArguments("query must not be empty".into()));
@@ -185,6 +251,8 @@ pub fn search(conn: &Connection, cfg: &SearchConfig, embedder: &dyn Embedder, re
         return Err(VltError::InvalidArguments("min_score must be between 0 and 1".into()));
     }
     let filter = Filter::new(req.where_.as_ref(), req.path_prefix.as_deref())?;
+    // One snapshot for every read: a reindex committed mid-search must not mix versions or drop a section.
+    let _snapshot = conn.unchecked_transaction()?;
     let filtered = !filter.is_empty();
     if filtered {
         let paths = load_filtered_paths(conn, &filter)?;
@@ -196,10 +264,14 @@ pub fn search(conn: &Connection, cfg: &SearchConfig, embedder: &dyn Embedder, re
 
     let bm25 = bm25_ids(conn, &req.query, filtered, cfg.k)?;
     let vector = vector_ids(conn, embedder, &req.query, filtered, cfg.k)?;
-    let fused = rrf(&[bm25, vector], cfg.rrf_k);
+    if let Some(t) = trace.as_deref_mut() {
+        t.bm25 = traced(conn, &bm25)?;
+        t.vector = traced(conn, &vector)?;
+    }
+    let fused = rerank_candidates(&bm25, &vector, cfg.rrf_k, cfg.rerank_top);
 
     let mut candidates = Vec::new();
-    for id in fused.into_iter().take(cfg.rerank_top) {
+    for id in fused {
         if let Some(c) = load_candidate(conn, id)? {
             candidates.push(c);
         }
@@ -207,28 +279,51 @@ pub fn search(conn: &Connection, cfg: &SearchConfig, embedder: &dyn Embedder, re
     if candidates.is_empty() {
         return empty();
     }
+    if let Some(t) = trace.as_deref_mut() {
+        t.fused = candidates.iter().map(|c| TracedChunk::of(&c.hit)).collect();
+    }
     let docs: Vec<&str> = candidates.iter().map(|c| c.fts_text.as_str()).collect();
     let scores = reranker.score(&req.query, &docs)?;
     if scores.len() != candidates.len() {
         return Err(VltError::Internal("the reranker returned a wrong number of scores".into()));
     }
 
-    let mut scored: Vec<(f64, SearchHit)> = candidates
+    let mut scored: Vec<(f64, Candidate)> = candidates
         .into_iter()
         .zip(scores)
-        .map(|(c, s)| (s as f64, c.hit))
-        .filter(|(s, _)| *s >= min_score)
+        .map(|(c, s)| (s as f64, c))
         .collect();
     scored.sort_by(|a, b| b.0.total_cmp(&a.0));
-    let results = scored
-        .into_iter()
-        .take(limit)
-        .map(|(s, mut hit)| {
+    if let Some(t) = trace {
+        t.reranked = scored.iter().map(|(s, c)| (TracedChunk::of(&c.hit), *s)).collect();
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut results = Vec::new();
+    for (s, c) in scored.into_iter().filter(|(s, _)| *s >= min_score) {
+        if results.len() == limit {
+            break;
+        }
+        if seen.insert((c.hit.document.path.clone(), c.section_id.clone())) {
+            let mut hit = whole_section(conn, c)?;
             hit.score = (s * 1000.0).round() / 1000.0;
-            hit
-        })
-        .collect();
+            results.push(hit);
+        }
+    }
     Ok(SearchResponse { results })
+}
+
+/// The candidate's hit widened to its whole section: every chunk of it, joined by a blank line.
+fn whole_section(conn: &Connection, c: Candidate) -> Result<SearchHit> {
+    let mut stmt = conn.prepare("SELECT content, start_line, end_line FROM chunks WHERE path = ?1 AND section_id = ?2 ORDER BY start_line")?;
+    let parts = stmt
+        .query_map(params![c.hit.document.path, c.section_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let (Some(first), Some(last)) = (parts.first(), parts.last()) else {
+        return Err(VltError::Internal(format!("section {} has no chunks in the index", c.section_id)));
+    };
+    let lines = [first.1 as usize, last.2 as usize];
+    let content = parts.iter().map(|p| p.0.as_str()).collect::<Vec<_>>().join("\n\n");
+    Ok(SearchHit { chunk_id: c.section_id, lines, content, ..c.hit })
 }
 
 #[cfg(test)]
@@ -371,6 +466,44 @@ mod tests {
     fn all(s: &str) -> SearchRequest { SearchRequest { limit: Some(100), min_score: Some(0.0), ..q(s) } }
 
     #[test]
+    fn search_traced_returns_the_same_response_and_every_stage() {
+        let (_d, db) = setup();
+        let cfg = SearchConfig::default();
+        let req = SearchRequest { min_score: Some(0.05), ..q("sqlite concurrent readers") };
+        let plain = search(db.conn(), &cfg, &FakeEmbedder, &SpyReranker::new(vec![0.9, 0.01, 0.5]), &req).unwrap();
+        let spy = SpyReranker::new(vec![0.9, 0.01, 0.5]);
+        let (traced, trace) = search_traced(db.conn(), &cfg, &FakeEmbedder, &spy, &req).unwrap();
+        assert_eq!(serde_json::to_value(&traced).unwrap(), serde_json::to_value(&plain).unwrap());
+        assert_eq!(trace.bm25.iter().map(|c| c.chunk_id.as_str()).collect::<Vec<_>>(), vec!["projects/db.md#Concurrency"]);
+        assert_eq!(trace.vector.len(), chunk_count(&db), "k = 50 exceeds the 3 chunks");
+        let fused_text: Vec<String> = trace.fused.iter().map(|c| fts_text_of(&db, &c.chunk_id)).collect();
+        assert_eq!(fused_text, spy.docs(), "fused is what the reranker received, in order");
+        assert_eq!(trace.reranked.len(), trace.fused.len(), "reranked keeps what min_score drops");
+        assert!(trace.reranked.windows(2).all(|w| w[0].1 >= w[1].1), "best first");
+        assert!(trace.reranked.iter().any(|(_, s)| *s < 0.05));
+        let c = trace.fused.iter().find(|c| c.chunk_id == "projects/db.md#Concurrency").unwrap();
+        assert_eq!((c.path.as_str(), c.content.as_str()), ("projects/db.md", "SQLite WAL mode allows concurrent readers."));
+    }
+
+    #[test]
+    fn rerank_candidates_keep_each_branch_top_in_rrf_order() {
+        let bm25: Vec<i64> = (1..=12).collect();
+        let vector: Vec<i64> = [20, 2, 3, 4, 5, 6, 7, 8, 9, 10, 30].to_vec();
+        assert_eq!(rrf(&[bm25.clone(), vector.clone()], 60).into_iter().take(10).collect::<Vec<_>>(), vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 1],
+            "plain RRF drops the vector branch's best, found by vectors alone");
+        assert_eq!(rerank_candidates(&bm25, &vector, 60, 10), vec![2, 3, 4, 5, 6, 7, 8, 9, 1, 20], "top 5 of each branch, filled and ordered by RRF");
+        assert_eq!(rerank_candidates(&bm25, &vector, 60, 3), vec![2, 1, 20], "odd: the extra slot goes to the vector branch");
+        assert_eq!(rerank_candidates(&bm25, &vector, 60, 1), vec![20]);
+    }
+
+    #[test]
+    fn rerank_candidates_fill_from_rrf_when_a_branch_is_short() {
+        assert_eq!(rerank_candidates(&[], &[7, 3, 9], 60, 10), vec![7, 3, 9]);
+        assert_eq!(rerank_candidates(&[4], &[7, 3, 9, 5], 60, 3), vec![4, 7, 3]);
+        assert_eq!(rerank_candidates(&[1, 2], &[1, 2], 60, 4), vec![1, 2]);
+    }
+
+    #[test]
     fn rrf_rank_is_one_based_and_ties_go_to_the_lower_id() {
         assert_eq!(rrf(&[vec![1, 2], vec![3, 2]], 1), vec![2, 1, 3]);
         assert_eq!(rrf(&[vec![9, 4], vec![2, 7]], 60), vec![2, 9, 4, 7]);
@@ -446,6 +579,19 @@ mod tests {
         assert_eq!(*embedder.seen.lock().unwrap(), vec!["query:copy nightly wal"], "the model's query prompt applies");
     }
 
+    #[test]
+    fn the_vector_branch_best_reaches_the_reranker_when_plain_rrf_would_drop_it() {
+        let (_d, db) = setup();
+        let pasta = fts_text_of(&db, "notes.md#Pasta");
+        let embedder = FixedEmbedder { vector: FakeEmbedder.embed(&[&pasta]).unwrap().remove(0), seen: Default::default() };
+        let spy = SpyReranker::new(vec![0.5]);
+        let cfg = SearchConfig { rerank_top: 2, ..SearchConfig::default() };
+        let (_, trace) = search_traced(db.conn(), &cfg, &embedder, &spy, &all("sqlite copy")).unwrap();
+        assert_eq!(trace.vector[0].chunk_id, "notes.md#Pasta", "vectors alone rank Pasta first");
+        assert_eq!(trace.bm25.len(), 2, "BM25 finds both db.md sections, which plain RRF ranks above Pasta");
+        assert!(spy.docs().contains(&pasta));
+    }
+
     /// 30 files under `a/` and `b/`, every third tagged `x`; several share identical text, so BM25 ties.
     fn bm25_vault() -> (tempfile::TempDir, Db) {
         let d = tempdir().unwrap();
@@ -507,5 +653,79 @@ mod tests {
         fill_filter_paths(db.conn(), &[]).unwrap();
         assert!(!bm25_ids(db.conn(), "apple", false, 10).unwrap().is_empty());
         assert!(bm25_ids(db.conn(), "apple", true, 10).unwrap().is_empty());
+    }
+
+    /// `big.md`: sections Topic (lines 3-8) and Other (lines 10-13), each paragraph too long to share a chunk.
+    fn split_vault() -> (tempfile::TempDir, Db) {
+        let d = tempdir().unwrap();
+        let v = d.path().join("vault");
+        fs::create_dir_all(&v).unwrap();
+        let p = |tag: &str| format!("zebra {tag} {}", (0..300).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" "));
+        let text = format!("# Big\n\n## Topic\n{}\n\n{}\n\n{}\n\n## Other\n{}\n\n{}\n", p("one"), p("two"), p("three"), p("four"), p("five"));
+        fs::write(v.join("big.md"), text).unwrap();
+        let mut db = Db::open(&d.path().join("vlt.db"), &IndexMeta { model_id: "fake".into(), dim: 384, fingerprint: "fake".into(), vault: "v".into() }).unwrap();
+        let src = || -> crate::Result<Arc<dyn crate::ml::Embedder>> { Ok(Arc::new(FakeEmbedder)) };
+        reindex(db.conn_mut(), &v, &build_exclude(&[]).unwrap(), &src, &mut |_, _| {}).unwrap();
+        assert_eq!(chunk_count(&db), 5, "every paragraph is its own chunk");
+        (d, db)
+    }
+
+    #[test]
+    fn a_hit_returns_its_whole_section_once() {
+        let (_d, db) = split_vault();
+        let r = run(&db, all("zebra")).unwrap();
+        assert_eq!(r.results.iter().map(|h| h.chunk_id.as_str()).collect::<HashSet<_>>(), HashSet::from(["big.md#Topic", "big.md#Other"]));
+        assert_eq!(r.results.len(), 2, "one result per section");
+        let topic = r.results.iter().find(|h| h.chunk_id == "big.md#Topic").unwrap();
+        let body: Vec<String> = fs::read_to_string(_d.path().join("vault/big.md")).unwrap().lines().map(String::from).collect();
+        assert_eq!(topic.content, body[3..8].join("\n"));
+        assert_eq!(topic.lines, [3, 8]);
+        assert_eq!(topic.heading_path, vec!["Big".to_string(), "Topic".to_string()]);
+    }
+
+    #[test]
+    fn limit_counts_sections_not_chunks() {
+        let (_d, db) = split_vault();
+        let r = run(&db, SearchRequest { limit: Some(2), ..all("zebra one two") }).unwrap();
+        let ids: Vec<&str> = r.results.iter().map(|h| h.chunk_id.as_str()).collect();
+        assert_eq!(ids, vec!["big.md#Topic", "big.md#Other"], "Topic's two best chunks fill one slot");
+    }
+
+    #[test]
+    fn a_section_scores_as_its_best_chunk() {
+        let (_d, db) = split_vault();
+        let (r, trace) = search_traced(db.conn(), &SearchConfig::default(), &FakeEmbedder, &FakeReranker, &all("zebra three")).unwrap();
+        let best = trace.reranked.iter().filter(|(c, _)| c.content.starts_with("zebra three")).map(|(_, s)| *s).fold(0.0, f64::max);
+        assert!(trace.reranked.iter().any(|(c, s)| c.content.starts_with("zebra one") && *s < best), "the parts score differently");
+        assert_eq!(r.results[0].chunk_id, "big.md#Topic");
+        assert_eq!(r.results[0].score, (best * 1000.0).round() / 1000.0);
+    }
+
+    /// Deletes `big.md`'s chunks from another connection while it scores, as a concurrent reindex would.
+    struct ReindexingReranker(std::path::PathBuf);
+    impl Reranker for ReindexingReranker {
+        fn score(&self, _query: &str, docs: &[&str]) -> crate::Result<Vec<f32>> {
+            rusqlite::Connection::open(&self.0)?.execute("DELETE FROM chunks WHERE path = 'big.md'", [])?;
+            Ok(vec![0.5; docs.len()])
+        }
+    }
+
+    #[test]
+    fn a_reindex_committed_mid_search_does_not_reach_its_results() {
+        let (d, db) = split_vault();
+        let r = search(db.conn(), &SearchConfig::default(), &FakeEmbedder, &ReindexingReranker(d.path().join("vlt.db")), &all("zebra")).unwrap();
+        assert_eq!(chunk_count(&db), 0, "the other connection committed");
+        let topic = r.results.iter().find(|h| h.document.path == "big.md" && h.heading_path.last().map(String::as_str) == Some("Topic")).unwrap();
+        let body: Vec<String> = fs::read_to_string(d.path().join("vault/big.md")).unwrap().lines().map(String::from).collect();
+        assert_eq!((topic.chunk_id.as_str(), topic.lines, topic.content.as_str()), ("big.md#Topic", [3, 8], body[3..8].join("\n").as_str()));
+    }
+
+    #[test]
+    fn a_section_without_chunks_is_an_error_not_the_bare_chunk() {
+        let (_d, db) = split_vault();
+        let id: i64 = db.conn().query_row("SELECT id FROM chunks WHERE chunk_id = 'big.md#Topic [1/3]'", [], |r| r.get(0)).unwrap();
+        let c = load_candidate(db.conn(), id).unwrap().unwrap();
+        db.conn().execute("DELETE FROM chunks WHERE section_id = 'big.md#Topic'", []).unwrap();
+        assert!(matches!(whole_section(db.conn(), c), Err(crate::VltError::Internal(_))));
     }
 }

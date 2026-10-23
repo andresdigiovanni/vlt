@@ -75,7 +75,7 @@ pub struct SearchConfig {
 
 impl Default for SearchConfig {
     fn default() -> Self {
-        SearchConfig { k: 50, rrf_k: 60, rerank_top: 10, limit: 5, min_score: 0.05 }
+        SearchConfig { k: 50, rrf_k: 60, rerank_top: 10, limit: 5, min_score: 0.02 }
     }
 }
 
@@ -121,7 +121,7 @@ k = 50            # candidates per branch (BM25 and vectors)
 rrf_k = 60        # Reciprocal Rank Fusion constant
 rerank_top = 10   # candidates passed to the reranker; each one costs reranking time
 limit = 5         # results returned by default
-min_score = 0.05  # reranker threshold [0, 1]; depends on the reranker, calibrate with real documents
+min_score = 0.02  # reranker threshold [0, 1]; depends on the reranker, calibrate with real documents
 "##
         )
     }
@@ -150,7 +150,7 @@ mod tests {
         assert_eq!(cfg.models.idle_unload_secs, 300);
         let s = &cfg.search;
         assert_eq!((s.k, s.rrf_k, s.rerank_top, s.limit), (50, 60, 10, 5));
-        assert!((s.min_score - 0.05).abs() < 1e-12);
+        assert!((s.min_score - 0.02).abs() < 1e-12);
     }
 
     #[test]

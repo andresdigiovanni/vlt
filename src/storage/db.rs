@@ -8,7 +8,7 @@ use crate::error::{Result, VltError};
 use crate::indexer::parser::{Heading, RawLink};
 use crate::ml::profile::LEGACY_FINGERPRINT;
 
-pub const SCHEMA_VERSION: &str = "1";
+pub const SCHEMA_VERSION: &str = "2";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexMeta {
@@ -38,6 +38,7 @@ pub struct FileRow {
 
 pub struct ChunkRow {
     pub chunk_id: String,
+    pub section_id: String,
     pub heading_path: Vec<String>,
     pub start_line: usize,
     pub end_line: usize,
@@ -73,6 +74,7 @@ CREATE TABLE IF NOT EXISTS excluded_files (path TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS chunks (
     id INTEGER PRIMARY KEY,
     chunk_id TEXT NOT NULL,
+    section_id TEXT NOT NULL,
     path TEXT NOT NULL,
     heading_path_json TEXT NOT NULL,
     start_line INTEGER NOT NULL,
@@ -298,14 +300,15 @@ pub fn put_file(
         ],
     )?;
     let mut insert_chunk = conn.prepare(
-        "INSERT INTO chunks (chunk_id, path, heading_path_json, start_line, end_line, content)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO chunks (chunk_id, section_id, path, heading_path_json, start_line, end_line, content)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )?;
     let mut insert_fts = conn.prepare("INSERT INTO chunks_fts (rowid, text) VALUES (?1, ?2)")?;
     let mut insert_vec = conn.prepare("INSERT INTO chunk_vectors (chunk_rowid, embedding) VALUES (?1, ?2)")?;
     for chunk in chunks {
         insert_chunk.execute(params![
             chunk.chunk_id,
+            chunk.section_id,
             file.path,
             to_json(&chunk.heading_path)?,
             chunk.start_line as i64,
@@ -377,7 +380,7 @@ mod tests {
                   properties: Some(serde_json::json!({"tags": ["a"]}).as_object().unwrap().clone()), frontmatter_error: None }
     }
     fn chunk(id: &str, text: &str, v: [f32; 2]) -> ChunkRow {
-        ChunkRow { chunk_id: id.into(), heading_path: vec!["H".into()], start_line: 1, end_line: 2,
+        ChunkRow { chunk_id: id.into(), section_id: id.into(), heading_path: vec!["H".into()], start_line: 1, end_line: 2,
                    content: text.into(), fts_text: text.into(), embedding: v.to_vec() }
     }
     fn count(c: &Connection, table: &str) -> i64 { c.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0)).unwrap() }

@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use ureq::tls::{RootCerts, TlsConfig};
+use ureq::unversioned::resolver::DefaultResolver;
+use ureq::unversioned::transport::{Buffers, ConnectionDetails, Connector, DefaultConnector, NextTimeout, Transport};
 
 use crate::ml::profile::model_dir;
 use crate::{Result, VltError};
@@ -19,6 +21,8 @@ const METADATA: [&str; 5] =
     ["config.json", "tokenizer.json", "modules.json", "config_sentence_transformers.json", "sentence_bert_config.json"];
 const WEIGHTS: &str = "model.safetensors";
 const SHARD_INDEX: &str = "model.safetensors.index.json";
+/// How long a download may go without sending or receiving a byte before it fails.
+const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// A completed download: the revision the config asked for, the commit it resolved to, and the
 /// sha256 of every file. The model stays at that commit until the config names another revision.
@@ -129,10 +133,64 @@ fn verified(path: &Path, expected: &Expected, sha256: Option<String>) -> Result<
     Ok(ok.then_some(sha256))
 }
 
-fn new_agent() -> ureq::Agent {
+/// ureq's transports wrapped so that no single read waits longer than `idle`; ureq's own
+/// timeouts are total budgets, which a multi-GB download cannot have.
+#[derive(Debug)]
+struct IdleTimeout {
+    inner: DefaultConnector,
+    idle: std::time::Duration,
+}
+
+#[derive(Debug)]
+struct IdleTransport {
+    inner: Box<dyn Transport>,
+    idle: std::time::Duration,
+}
+
+impl IdleTransport {
+    fn capped(&self, timeout: NextTimeout) -> NextTimeout {
+        NextTimeout { after: timeout.after.min(self.idle.into()), reason: timeout.reason }
+    }
+}
+
+impl Connector<()> for IdleTimeout {
+    type Out = IdleTransport;
+
+    fn connect(&self, details: &ConnectionDetails, chained: Option<()>) -> std::result::Result<Option<IdleTransport>, ureq::Error> {
+        Ok(self.inner.connect(details, chained)?.map(|inner| IdleTransport { inner, idle: self.idle }))
+    }
+}
+
+impl Transport for IdleTransport {
+    fn buffers(&mut self) -> &mut dyn Buffers {
+        self.inner.buffers()
+    }
+
+    fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> std::result::Result<(), ureq::Error> {
+        self.inner.transmit_output(amount, timeout)
+    }
+
+    fn await_input(&mut self, timeout: NextTimeout) -> std::result::Result<bool, ureq::Error> {
+        let timeout = self.capped(timeout);
+        self.inner.await_input(timeout)
+    }
+
+    fn is_open(&mut self) -> bool {
+        self.inner.is_open()
+    }
+
+    fn is_tls(&self) -> bool {
+        self.inner.is_tls()
+    }
+}
+
+fn new_agent(idle: std::time::Duration) -> ureq::Agent {
     // OS trust store, so TLS-inspecting corporate proxies are trusted like in a browser.
     let tls = TlsConfig::builder().root_certs(RootCerts::PlatformVerifier).build();
-    ureq::Agent::config_builder().tls_config(tls).build().new_agent()
+    // The connect budget covers the TCP connect, the TLS handshake and any proxy setup, which
+    // run before the transport is wrapped.
+    let config = ureq::Agent::config_builder().tls_config(tls).timeout_connect(Some(idle)).build();
+    ureq::Agent::with_parts(config, IdleTimeout { inner: DefaultConnector::new(), idle }, DefaultResolver::default())
 }
 
 /// The commit `revision` of `id` points to and the files it holds.
@@ -291,7 +349,7 @@ pub fn pull(
     }
     let dir = model_dir(models_dir, id);
     std::fs::create_dir_all(&dir)?;
-    let agent = new_agent();
+    let agent = new_agent(IDLE_TIMEOUT);
     let info = repo_info(&agent, base_url, id, revision)?;
     let mut files = select(&info, id)?;
     // The files are about to change, so an old lock would vouch for files it no longer matches.
@@ -552,6 +610,68 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let err = pull_from(d.path(), "no/such", "main", &Hub::new(vec![])).unwrap_err().to_string();
         assert!(err.contains("no/such") && err.contains("not found on Hugging Face"), "{err}");
+    }
+
+    #[test]
+    fn a_download_that_stops_sending_fails_instead_of_hanging() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/m.bin", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let _ = s.read(&mut [0u8; 4096]);
+            write!(s, "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nhello").unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        });
+        let d = tempfile::tempdir().unwrap();
+        let part = d.path().join("m.bin.part");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let agent = new_agent(std::time::Duration::from_millis(300));
+            let _ = tx.send(download(&agent, &url, &part, "m.bin", &mut |_, _, _| {}).map_err(|e| e.to_string()));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("the download is still blocked on a silent server");
+        let err = got.unwrap_err();
+        assert!(err.contains("download failed") && err.contains("timeout"), "{err}");
+    }
+
+    #[test]
+    fn a_server_that_never_answers_the_tls_handshake_fails_instead_of_hanging() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("https://{}/m.bin", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let _ = s.read(&mut [0u8; 4096]);
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        });
+        let d = tempfile::tempdir().unwrap();
+        let part = d.path().join("m.bin.part");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let agent = new_agent(std::time::Duration::from_millis(300));
+            let _ = tx.send(download(&agent, &url, &part, "m.bin", &mut |_, _, _| {}).map_err(|e| e.to_string()));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("the download is still blocked in the TLS handshake");
+        let err = got.unwrap_err();
+        assert!(err.contains("download failed") && err.contains("timeout"), "{err}");
+    }
+
+    #[test]
+    fn a_slow_download_that_keeps_sending_completes() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/m.bin", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let _ = s.read(&mut [0u8; 4096]);
+            write!(s, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n").unwrap();
+            for b in b"hello" {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                s.write_all(&[*b]).unwrap();
+            }
+        });
+        let d = tempfile::tempdir().unwrap();
+        let part = d.path().join("m.bin.part");
+        let agent = new_agent(std::time::Duration::from_millis(300));
+        assert_eq!(download(&agent, &url, &part, "m.bin", &mut |_, _, _| {}).unwrap(), HELLO_SHA256, "750 ms in all, no gap over 300 ms");
     }
 
     #[test]

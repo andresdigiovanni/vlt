@@ -7,6 +7,8 @@ use crate::indexer::parser::{fence_open, is_fence_close, Heading, ParsedDoc};
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chunk {
     pub chunk_id: String,
+    /// The id of the section this chunk belongs to: its `chunk_id` without the ` [i/n]` part.
+    pub section_id: String,
     pub heading_path: Vec<String>,
     pub start_line: usize,
     pub end_line: usize,
@@ -116,6 +118,7 @@ pub fn chunk(
 
         if count_tokens(&embed_of(s, e)) <= max_tokens {
             chunks.push(Chunk {
+                section_id: base_id.clone(),
                 chunk_id: base_id,
                 heading_path,
                 start_line: first_start,
@@ -141,6 +144,7 @@ pub fn chunk(
                 unique_id(format!("{base_id} [{}/{n}]", i + 1), &mut taken)
             };
             chunks.push(Chunk {
+                section_id: base_id.clone(),
                 chunk_id,
                 heading_path: heading_path.clone(),
                 start_line: if i == 0 { first_start } else { base_line + ps },
@@ -233,6 +237,15 @@ mod tests {
         let doc = parse("# T\na\n\nb\n# T [1/2]\nx\n", "doc");
         let c = chunk("dir/doc.md", &doc, 1, &only_letters);
         assert_eq!(ids(&c), vec!["dir/doc.md#T [1/2]", "dir/doc.md#T [2/2]", "dir/doc.md#T [1/2] (2)"]);
+    }
+
+    #[test]
+    fn every_part_carries_the_id_of_its_section() {
+        let only_letters = |s: &str| s.split_whitespace().filter(|w| ["a", "b", "x"].contains(w)).count();
+        let doc = parse("# T\na\n\nb\n# T [1/2]\nx\n", "doc");
+        let c = chunk("dir/doc.md", &doc, 1, &only_letters);
+        let sections: Vec<&str> = c.iter().map(|c| c.section_id.as_str()).collect();
+        assert_eq!(sections, vec!["dir/doc.md#T", "dir/doc.md#T", "dir/doc.md#T [1/2] (2)"]);
     }
 
     #[test]

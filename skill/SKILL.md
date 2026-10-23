@@ -28,7 +28,7 @@ Never start Enriching on your own. While answering, if you notice a missing prop
 
 ## Answering
 
-1. `search` with a short English query of key terms ("sqlite concurrency wal"), not the whole question. The notes and models are in English; answer in the user's language.
+1. `search` with a short English query of key terms ("sqlite concurrency wal"), not the whole question. Name things by the term a note would use, not by a description of them: "declaration of helsinki", not "the 1964 ethics code for doctors". The notes and models are in English; answer in the user's language.
 2. When the user names a property, value or folder ("my in-progress projects", "notes tagged rust"), call `properties` first and filter with the keys and values it returns, never guessed ones:
    - `where` scalar: `{"status": "in_progress"}`; on a list property: `{"tags": "rust"}` (contains), `{"tags": ["rust", "mcp"]}` (contains all);
    - dates and numbers: `{"date": {"gte": "2026-01-01", "lt": "2026-07-01"}}` (`gt`, `gte`, `lt`, `lte`);
@@ -36,7 +36,7 @@ Never start Enriching on your own. While answering, if you notice a missing prop
 3. `get` the document only when the returned section is not enough.
 4. Cite the `chunk_id` of each section you use (`projects/mcp_rust.md#Concurrency`) and keep what the vault says apart from what you add.
 
-No results means nothing relevant: reformulate once (synonyms, a broader term), then say the vault has nothing on it. Never lower `min_score` to force results.
+A section can be on the topic without answering the question: read its `content` before you use it. No results, or none that answers, means nothing relevant: reformulate once (the technical term, a synonym, a broader term), then say the vault has nothing on it. Never lower `min_score` to force results.
 
 Answering never writes. If notes look outdated or contradict each other, propose the fix as a numbered list.
 
@@ -83,7 +83,7 @@ vlt searches by section: a section is retrieved and read without the rest of its
 
 Errors arrive as `{"error": {"code": ..., "message": ...}}`. Retry at most once.
 
-- `index_rebuild_required`: the index was built for another model or vault. Ask the user to run `vlt reindex --force` in a terminal, then retry.
+- `index_rebuild_required`: the index was built for another model or vault, or by an older vlt. Ask the user to run `vlt reindex --force` in a terminal, then retry.
 - `document_not_found`: the path is not indexed (mistyped, or excluded in `~/.vlt/config.toml`). Use a `document.path` from `search`; never guess paths. If the user named the path, tell them.
 - `path_outside_vault`: use the vault-relative paths that `search` and `get` return.
 - `invalid_arguments`: fix the call as the message says.

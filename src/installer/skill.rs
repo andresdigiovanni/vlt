@@ -60,7 +60,8 @@ mod tests {
         assert!(fm.contains("general knowledge"), "description must exclude general knowledge");
         for needle in ["search", "`get`", "`properties`", "reindex", "min_score", "where", "path_prefix",
                        "chunk_id", "English", "index_rebuild_required", "vlt reindex --force",
-                       "document_not_found", "in_progress", "reformulate", "user's language"] {
+                       "document_not_found", "in_progress", "reformulate", "user's language",
+                       "the term a note would use", "read its `content`", "older vlt"] {
             assert!(SKILL_MD.contains(needle), "SKILL.md must mention {needle}");
         }
         for forbidden in ["VLT_HOME", "VLT_FAKE_MODELS", "edit_document"] {

@@ -29,7 +29,7 @@ flowchart LR
     T -- no --> D["dropped"]
 ```
 
-- **Hybrid search**: keyword search (SQLite FTS5) and semantic search (sqlite-vec) over the sections of every note, fused with Reciprocal Rank Fusion and reranked by a local cross-encoder. Results below a relevance threshold are dropped, so "nothing relevant" is an answer, not five random hits.
+- **Hybrid search**: keyword search (SQLite FTS5) and semantic search (sqlite-vec) over the sections of every note, the best of each fused with Reciprocal Rank Fusion and reranked by a local cross-encoder. Results below a relevance threshold are dropped, so "nothing relevant" is an answer, not five random hits.
 - **Filters**: by frontmatter property (`status=in_progress`, `tags=rust`, `date>=2026-01-01`) and by folder.
 - **Enrichment on request**: ask the agent to "process the note X" and it proposes properties that match your vault's vocabulary, links from and to related notes, and fixes for broken links. It writes only the changes you pick.
 - **Local models**: embeddings and reranking run on your CPU with [Candle](https://github.com/huggingface/candle). Pick any Hugging Face model of a [supported architecture](#models). Models are downloaded once, checked against the hashes Hugging Face publishes, and locked to that commit; vlt works offline afterwards.
@@ -257,7 +257,7 @@ k = 50            # candidates per branch (BM25 and vectors)
 rrf_k = 60        # Reciprocal Rank Fusion constant
 rerank_top = 10   # candidates passed to the reranker; each one costs reranking time
 limit = 5         # results returned by default
-min_score = 0.05  # reranker threshold [0, 1]; depends on the reranker, calibrate with real documents
+min_score = 0.02  # reranker threshold [0, 1]; depends on the reranker, calibrate with real documents
 ```
 
 Changing `exclude` does not require a rebuild: the next incremental reindex drops the newly excluded paths and indexes the ones that are no longer excluded.
@@ -281,7 +281,7 @@ Models compute in the precision their weights are stored in: 16-bit weights (F16
 
 `vlt reindex` (and `vlt install`) downloads a model the first time it is configured, at the revision set in the options (`main` by default). vlt checks each file against the hash Hugging Face publishes for that commit and records the commit and hashes in `vlt-lock.json` in the model's folder. From then on the model stays at that commit, even if the repo changes; set another `revision` to move it. An unsupported model is reported right after its download, with the reason. Private and gated repos are not supported.
 
-Model size sets speed and memory on a CPU, and the reranker dominates both: it reads every candidate in full. Measured on an Apple M-series CPU, reranking 10 sections of ~290 tokens (the default `rerank_top`) takes about 5 s with `mixedbread-ai/mxbai-rerank-base-v1` (the default), 15 s with `mixedbread-ai/mxbai-rerank-large-v1`, 2.3 s with `mixedbread-ai/mxbai-rerank-xsmall-v1` and 0.8 s with `cross-encoder/ms-marco-MiniLM-L-6-v2`; time grows in proportion to `rerank_top` and to section length. With the defaults vlt peaks at about 2.3 GB of memory; `BAAI/bge-small-en-v1.5` with `cross-encoder/ms-marco-MiniLM-L-6-v2` (the defaults of vlt 0.1.0) need about 350 MB.
+Model size sets speed and memory on a CPU, and the reranker dominates both: it reads every candidate in full. Measured on an Apple M-series CPU, reranking 10 chunks of 256 tokens (the default `rerank_top` and chunk size) takes about 4.3 s with `mixedbread-ai/mxbai-rerank-base-v1` (the default), 12.6 s with `mixedbread-ai/mxbai-rerank-large-v1`, 1.8 s with `mixedbread-ai/mxbai-rerank-xsmall-v1` and 0.6 s with `cross-encoder/ms-marco-MiniLM-L-6-v2`; time grows in proportion to `rerank_top` and to chunk length. With the defaults vlt peaks at about 2.3 GB of memory; `BAAI/bge-small-en-v1.5` with `cross-encoder/ms-marco-MiniLM-L-6-v2` (the defaults of vlt 0.1.0) need about 350 MB.
 
 ## Where everything lives
 
