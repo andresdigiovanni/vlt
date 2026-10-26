@@ -9,11 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Tags written in the body (`#tag`, `#nested/tag`) count as tags, as in Obsidian, and `get` lists every tag of a note, frontmatter and body, in a new `tags` field.
 - `get` lists the `candidates` of an ambiguous link: the paths it could mean, so the agent can propose the fix.
 - `properties` takes a `key` (`vlt properties --key tags`) and lists that property alone with every value, not only the 10 most frequent: the agent can check whether a tag already exists before proposing a new one.
+- Links in properties (`up: "[[note]]"`, quoted as Obsidian requires) count as links and backlinks, as in Obsidian; `get` marks each with the `property` it is in.
+- `properties` takes `where` (`vlt properties --where type=project`), with the syntax of `search`: it counts only the notes it selects, so the agent sees which keys notes of one kind use.
+- `properties` lists each key's `variants`: spellings of one value that differ only in case or in `-`, `_` and spaces (`Rust` and `rust`, `machine-learning` and `machine_learning`), most used first; `vlt properties` prints them under the key.
+- `folders` (MCP tool and `vlt folders`) lists the vault's folders: per folder the notes directly in it, the total with its subfolders and its 5 most used keys, so the agent sees where a new note belongs.
+- `related` (MCP tool and `vlt related <path>`) lists the notes closest to a note by meaning, section by section, with the links that already exist; the tags two or more of the closest of them carry and the note lacks; and the sections of other notes that name it (title, alias or file name) without a link. The Skill starts from it when linking a note.
+- `audit` (MCP tool and `vlt audit`) reports what only shows across notes: spelling variants of values and keys with the notes to change, keys one note has, keys and tags on most but not all of a folder's notes (with the notes missing them), broken and ambiguous links, notes nobody links and notes linking nowhere. The Skill has an Auditing flow that turns it into one list of fixes.
+- `create` (MCP tool) writes a new note the user approved: the whole file at a vault-relative `.md` path, creating missing folders. It never overwrites (`already_exists`, a new error code) and rejects excluded paths. The Skill's Drafting flow now ends with `create` instead of asking you to save the file.
 
 ### Changed
 
+- The `tags` filter and `properties` count body `#tags` too: `tags=rust` finds a note that writes `#rust` only in its text, and `tags=#rust` is the same filter.
+- A frontmatter `tags` string is split on commas and spaces (`tags: rust, mcp` is two tags) and loses a leading `#`; each piece is cut at the first character a tag cannot hold, as in the body (`"#mcp"` → `mcp`); all-digit tags (`2024`) are not tags, as in Obsidian; `properties` reports `tags` as a list counted once per note.
 - A `tags` filter also matches nested tags, as Obsidian does: `tags=project` (or `tags=project/`) finds notes tagged `project/vlt` or `project/vlt/cli`, not `projects`. Other properties still match exact values.
 - The reranker gets the top half of `rerank_top` from each search branch (vectors take the odd slot), in Reciprocal Rank Fusion order, instead of the RRF top: a section only the semantic branch finds no longer loses its place to sections both branches rank low. On the eval set (`make eval`), Recall@5 rises from 0.826 to 0.878, and from 0.489 to 0.644 on paraphrased questions.
 - `min_score` defaults to 0.02 (was 0.05): on the eval set the default reranker scores some correct answers between 0.02 and 0.05, and no threshold separates relevant from unrelated sections well, so 0.05 cost answers for little filtering: Recall@5 rises from 0.878 to 0.907, while the questions the eval set cannot answer that come back empty drop from 2 of 15 to none. Existing configs keep their value.

@@ -3,12 +3,16 @@ use std::path::PathBuf;
 use globset::GlobSet;
 use rusqlite::OptionalExtension;
 
+use crate::audit::{self, AuditResponse};
 use crate::config::Config;
-use crate::documents::{self, DocumentResponse, PropertiesResponse};
+use crate::documents::{self, DocumentResponse, FoldersResponse, PropertiesResponse};
+use crate::indexer::parser::split_frontmatter;
 use crate::indexer::scanner::{build_exclude, IndexLock};
 use crate::indexer::{self, ReindexStats};
+use crate::links;
 use crate::ml::models::Models;
 use crate::paths;
+use crate::related::{self, RelatedResponse};
 use crate::search::{self, SearchRequest, SearchResponse};
 use crate::storage::db::{self, Db, SCHEMA_VERSION};
 use crate::write::{self, Loaded, WriteResponse};
@@ -131,6 +135,62 @@ impl App {
         Ok(WriteResponse { ok: true, path: path.to_string(), diff, reindexed })
     }
 
+    /// Writes a new note at `path`; never replaces a file or folder that is there.
+    pub fn create(&self, path: &str, content: &str) -> Result<WriteResponse> {
+        let abs = documents::resolve_in_vault(&self.cfg.vault, path)?;
+        let name = abs.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if !abs.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("md")) {
+            return Err(VltError::InvalidArguments(format!("{path} is not a Markdown (.md) document")));
+        }
+        let requested = abs.strip_prefix(&self.cfg.vault).map_err(|e| VltError::Internal(e.to_string()))?;
+        self.check_readable(path, &requested.to_string_lossy())?;
+        let lf = content.strip_prefix('\u{feff}').unwrap_or(content).replace("\r\n", "\n");
+        if let (_, Some(error), _, _) = split_frontmatter(&lf) {
+            return Err(VltError::InvalidFrontmatter(error));
+        }
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if std::fs::symlink_metadata(&abs).is_ok() {
+            return Err(VltError::AlreadyExists(path.to_string()));
+        }
+        let parent = abs.parent().ok_or_else(|| VltError::InvalidArguments(format!("{path} has no folder")))?;
+        std::fs::create_dir_all(parent).map_err(|e| match e.kind() {
+            std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotADirectory => {
+                VltError::InvalidArguments(format!("a folder in {path} is a file"))
+            }
+            _ => e.into(),
+        })?;
+        // Where the folder really is: on a case-insensitive filesystem `Ideas/` may be `ideas/`, and a
+        // folder swapped for a symlink since the checks above points elsewhere.
+        let vault = std::fs::canonicalize(&self.cfg.vault)?;
+        let real_parent = std::fs::canonicalize(parent)?;
+        let real_dir = real_parent.strip_prefix(&vault).map_err(|_| VltError::PathOutsideVault(path.to_string()))?;
+        let asked_dir = requested.parent().unwrap_or(requested);
+        if links::normalize(&real_dir.to_string_lossy()) != links::normalize(&asked_dir.to_string_lossy()) {
+            return Err(VltError::PathOutsideVault(path.to_string()));
+        }
+        let stored = real_dir.join(&name).to_string_lossy().into_owned();
+        self.check_readable(path, &stored)?;
+        write::create_new(&real_parent.join(&name), content.as_bytes()).map_err(|e| match e.kind() {
+            std::io::ErrorKind::AlreadyExists => VltError::AlreadyExists(path.to_string()),
+            _ => e.into(),
+        })?;
+        let reindexed = matches!(self.reindex_incremental(), Ok(o) if o.reindexed);
+        Ok(WriteResponse { ok: true, path: stored, diff: write::diff_hunk("", &lf), reindexed })
+    }
+
+    /// Rejects a vault-relative path the index would skip, so a created note can be read back.
+    fn check_readable(&self, path: &str, rel: &str) -> Result<()> {
+        if rel.split('/').any(|part| part.starts_with('.')) {
+            return Err(VltError::InvalidArguments(format!("{path} is in a hidden file or folder, which vlt does not index")));
+        }
+        if self.exclude.is_match(rel) {
+            return Err(VltError::InvalidArguments(format!(
+                "{path} is excluded by the configuration (exclude), so vlt could not read it back"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn edit(&self, path: &str, old_text: &str, new_text: &str) -> Result<WriteResponse> {
         self.write_document(path, |lf| write::edit_text(lf, old_text, new_text))
     }
@@ -149,9 +209,24 @@ impl App {
         documents::get_document(db.conn(), &self.cfg.vault, path)
     }
 
-    pub fn list_properties(&self, path_prefix: Option<&str>, key: Option<&str>) -> Result<PropertiesResponse> {
+    pub fn list_properties(&self, where_: Option<&serde_json::Value>, path_prefix: Option<&str>, key: Option<&str>) -> Result<PropertiesResponse> {
         let db = self.open_for_read()?;
-        documents::list_properties(db.conn(), path_prefix, key)
+        documents::list_properties(db.conn(), where_, path_prefix, key)
+    }
+
+    pub fn list_folders(&self, path_prefix: Option<&str>) -> Result<FoldersResponse> {
+        let db = self.open_for_read()?;
+        documents::list_folders(db.conn(), path_prefix)
+    }
+
+    pub fn audit(&self, path_prefix: Option<&str>) -> Result<AuditResponse> {
+        let db = self.open_for_read()?;
+        audit::audit(db.conn(), path_prefix)
+    }
+
+    pub fn related(&self, path: &str, limit: Option<usize>) -> Result<RelatedResponse> {
+        let db = self.open_for_read()?;
+        related::related(db.conn(), &self.cfg.vault, path, self.cfg.search.k, limit.unwrap_or(10))
     }
 }
 

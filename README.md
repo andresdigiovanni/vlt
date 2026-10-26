@@ -2,7 +2,7 @@
 
 > **Semantic search over your Obsidian vault, for your AI agent and for you.**
 
-vlt turns a vault (a folder of markdown notes) into a knowledge base your AI agent can search. It indexes your notes locally and serves them through **MCP for agents** and the **`vlt` CLI for humans**: the agent finds the right sections of your notes, answers from them, and, when you ask, adds properties and links to them.
+vlt turns a vault (a folder of markdown notes) into a knowledge base your AI agent can search. It indexes your notes locally and serves them through **MCP for agents** and the **`vlt` CLI for humans**: the agent finds the right sections of your notes, answers from them, and, when you ask, adds properties and links to them and writes the new notes you approve.
 
 Everything runs on your machine: no daemon, no cloud, no API keys.
 
@@ -30,7 +30,7 @@ flowchart LR
 ```
 
 - **Hybrid search**: keyword search (SQLite FTS5) and semantic search (sqlite-vec) over the sections of every note, the best of each fused with Reciprocal Rank Fusion and reranked by a local cross-encoder. Results below a relevance threshold are dropped, so "nothing relevant" is an answer, not five random hits.
-- **Filters**: by frontmatter property (`status=in_progress`, `tags=rust`, `date>=2026-01-01`) and by folder. A tag also matches its nested tags: `tags=project` finds `project/vlt`.
+- **Filters**: by frontmatter property (`status=in_progress`, `tags=rust`, `date>=2026-01-01`) and by folder. A tag also matches its nested tags: `tags=project` finds `project/vlt`. `tags` covers the frontmatter and `#tags` written in the body, as in Obsidian. `tags=#rust` and `tags=rust` are the same filter.
 - **Enrichment on request**: ask the agent to "process the note X" and it proposes properties that match your vault's vocabulary, links from and to related notes, and fixes for broken links. It writes only the changes you pick.
 - **Local models**: embeddings and reranking run on your CPU with [Candle](https://github.com/huggingface/candle). Pick any Hugging Face model of a [supported architecture](#models). Models are downloaded once, checked against the hashes Hugging Face publishes, and locked to that commit; vlt works offline afterwards.
 
@@ -147,11 +147,12 @@ Without `vlt install` you also need `~/.vlt/config.toml` (see [Configuration](#c
 
 ### With your agent
 
-The agent uses vlt in three flows:
+The agent uses vlt in four flows:
 
 - **Answering.** When you ask what you know or wrote about something, or when the task depends on your notes (one of your projects, a past decision, a convention), the agent searches the vault, reads what it needs and cites the sections it used (`projects/mcp_rust.md#Concurrency`).
 - **Enriching.** When you ask it to process a note, add properties to it or link it, the agent proposes one numbered list: properties, links from the note, links to it from other notes, and repairs for broken links. You pick ("apply 1, 3"), and it writes only those.
-- **Drafting.** When you ask it to write something up as a new note, the agent first searches for a note that already covers it, then drafts the note with the properties and file name its folder uses and links in the prose. vlt doesn't create files: you save it, and the agent offers to link other notes to it.
+- **Drafting.** When you ask it to write something up as a new note, the agent first searches for a note that already covers it, then drafts the note with the properties and file name its folder uses and links in the prose. Once you approve the draft, the agent writes it with `create`, which never overwrites a note, and offers to link other notes to it.
+- **Auditing.** When you ask it to audit the vault or a folder, the agent runs `audit` and proposes one numbered list of fixes across notes: one spelling per value and key, the keys and tags a folder's notes share, and repairs for broken links; notes nobody links are offered for processing. It applies only the ones you pick.
 
 ```mermaid
 sequenceDiagram
@@ -159,7 +160,7 @@ sequenceDiagram
     participant Agent
     participant vlt
     You->>Agent: Process the note projects/vlt_design.md
-    Agent->>vlt: get · properties · search
+    Agent->>vlt: get · properties · related · search
     vlt-->>Agent: the note, the vault's vocabulary, related notes
     Agent->>You: numbered list: properties, links, repairs
     You->>Agent: apply 1, 3
@@ -179,7 +180,7 @@ vlt properties
 
 ### Keeping the index fresh
 
-You don't need to reindex by hand. Every search, `get` and `properties` call picks up the notes you added, changed or deleted since the last one, and every write by the agent reindexes the note it changed. `vlt reindex` exists for a full rebuild (`--force`) or to warm the index ahead of time.
+You don't need to reindex by hand. Every `search`, `get`, `properties`, `folders`, `related` and `audit` call picks up the notes you added, changed or deleted since the last one, and every write by the agent reindexes the note it changed. `vlt reindex` exists for a full rebuild (`--force`) or to warm the index ahead of time.
 
 ## CLI reference
 
@@ -189,7 +190,10 @@ vlt uninstall [--yes]
 vlt mcp
 vlt search <query> [--where <expr>]... [--path-prefix <p>] [--limit <n>] [--json]
 vlt get <path> [--json]
-vlt properties [--path-prefix <p>] [--json]
+vlt properties [--where <expr>]... [--path-prefix <p>] [--json]
+vlt folders [--path-prefix <p>] [--json]
+vlt related <path> [--limit <n>] [--json]
+vlt audit [--path-prefix <p>] [--json]
 vlt reindex [--force]
 ```
 
@@ -200,7 +204,10 @@ vlt reindex [--force]
 | `mcp` | Runs the MCP server on stdio (the agent starts it). |
 | `search` | Hybrid search. `--where` filters by property (repeatable), `--path-prefix` restricts to a folder, `--limit` overrides the configured value. |
 | `get` | Shows a document (path relative to the vault): its title, path, properties and content. `--json` adds its sections, outgoing links and backlinks. |
-| `properties` | Lists the frontmatter properties with their inferred type, the number of documents using them and their most frequent values; `--key` shows one property with every value. |
+| `properties` | Lists the frontmatter properties with their inferred type, the number of documents using them and their most frequent values; `--key` shows one property with every value; `tags` also counts body `#tags`. `--where` counts only the notes it selects, with the syntax of `search`. Spelling variants of a value are listed under its key. |
+| `folders` | Lists the folders with the notes directly in each, the total with subfolders and the 5 most used keys; the root is `/`. |
+| `related` | Shows the notes closest to a note (with the matching sections and existing links), the tags two or more of them share, and the sections of other notes that name it without a link. |
+| `audit` | Reports spelling variants, rare keys, folder gaps, broken links, orphans and notes linking nowhere, each section capped at 50 lines with its total. |
 | `reindex` | Incremental reindex; `--force` rebuilds the index from scratch. Downloads the configured models first if they are missing. |
 
 `--json` prints the same payload the MCP tool returns.
@@ -211,20 +218,24 @@ Errors are printed to stderr as `error: <message>` with exit code 1.
 
 ## MCP tools
 
-The server is named `vlt`. It exposes six tools:
+The server is named `vlt`. It exposes ten tools:
 
 | Tool | Purpose |
 |---|---|
 | `search` | Hybrid search with property filters, reranking and a score threshold. Parameters: `query`, `where`, `path_prefix`, `limit`, `min_score`. |
-| `get` | Full document (`path`) with properties, sections, outgoing links (an ambiguous one with its `candidates`) and backlinks. |
-| `properties` | Inventory of the vault's properties (optional `path_prefix`; optional `key` for one property with every value). |
+| `get` | Full document (`path`) with properties, tags (frontmatter and body), sections, outgoing links (an ambiguous one with its `candidates`, one in a property with its `property` key) and backlinks. |
+| `properties` | Inventory of the vault's properties (optional `where`, as in `search`, and `path_prefix`; optional `key` for one property with every value; each key's `variants`, spellings of one value that differ only in case or separators). |
+| `folders` | The vault's folders with their notes (directly in each, and with subfolders) and their 5 most used keys (optional `path_prefix`). |
+| `related` | Notes related to a note (`path`, optional `limit`): the closest notes with the sections that match and the links that exist, the tags they share, and sections that name the note without a link. |
+| `audit` | Health report (optional `path_prefix`): spelling variants of values and keys, keys one note has, keys and tags most of a folder has with the notes missing them, broken links, notes nobody links and notes linking nowhere; each section with its `total` and at most 50 items. |
 | `reindex` | Detects changes in the vault and reindexes them incrementally. |
 | `edit` | Replaces one exact fragment of a document's body. Parameters: `path`, `old_text`, `new_text`. |
 | `update_properties` | Adds, changes or removes frontmatter properties of a document, keeping the rest of the file as it is. Parameters: `path`, `set`, `unset`. |
+| `create` | Writes a new note (`path`, `content`: the whole file), creating missing folders. Never overwrites: an existing path is `already_exists`; excluded paths are rejected. |
 
 ### What vlt writes
 
-`edit` and `update_properties` are the only tools that write to the vault, and they only change existing `.md` files inside it. The agent calls them for the changes you approve from the list it proposes. vlt never creates, moves or deletes documents, and the `vlt` CLI never edits them.
+`edit`, `update_properties` and `create` are the only tools that write to the vault: the first two change existing `.md` files inside it, and `create` writes new ones, never over an existing file. The agent calls them for the changes and drafts you approve. vlt never moves or deletes documents, and the `vlt` CLI never writes to them.
 
 ## Configuration
 
@@ -299,7 +310,7 @@ flowchart LR
     vlt --- index
     vlt --- models
     vlt -- "reads changed notes" --> vault[/"your vault<br/>markdown notes"/]
-    vlt -. "edit · update_properties<br/>only what you approve" .-> vault
+    vlt -. "create · edit · update_properties<br/>only what you approve" .-> vault
 ```
 
 ```text
@@ -309,7 +320,7 @@ flowchart LR
 └── models/       # embedding and reranking models
 ```
 
-Your vault stays exactly as it is: vlt keeps nothing inside it and only writes there through `edit` and `update_properties`, when you approve a change.
+Your vault stays exactly as it is: vlt keeps nothing inside it and only writes there through `create`, `edit` and `update_properties`, when you approve a change.
 
 ## Uninstall
 

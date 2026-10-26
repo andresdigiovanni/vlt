@@ -94,13 +94,21 @@ fn parse_properties(raw: Option<String>) -> Result<Option<Map<String, Value>>> {
 }
 
 pub fn load_filtered_paths(conn: &Connection, filter: &Filter) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare("SELECT path, properties_json FROM files ORDER BY path")?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?;
+    let mut stmt = conn.prepare("SELECT path, properties_json, tags_json FROM files ORDER BY path")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, String>(2)?)))?;
     let mut out = Vec::new();
     for row in rows {
-        let (path, raw) = row?;
-        let props = parse_properties(raw)?;
-        if filter.matches(&path, props.as_ref()) {
+        let (path, raw, tags) = row?;
+        let mut props = parse_properties(raw)?.unwrap_or_default();
+        // A `tags` condition matches the effective tags: frontmatter and body `#tags`.
+        let tags: Vec<Value> =
+            serde_json::from_str(&tags).map_err(|e| VltError::Internal(format!("stored tags are not valid JSON: {e}")))?;
+        if tags.is_empty() {
+            props.remove("tags");
+        } else {
+            props.insert("tags".to_string(), Value::Array(tags));
+        }
+        if filter.matches(&path, Some(&props)) {
             out.push(path);
         }
     }
@@ -353,6 +361,27 @@ mod tests {
         search(db.conn(), &SearchConfig::default(), &FakeEmbedder, &FakeReranker, &req)
     }
     fn q(s: &str) -> SearchRequest { SearchRequest { query: s.into(), ..Default::default() } }
+
+    #[test]
+    fn a_tags_filter_matches_body_tags_and_normalized_frontmatter_tags() {
+        let d = tempdir().unwrap();
+        let v = d.path().join("vault");
+        fs::create_dir_all(&v).unwrap();
+        for (p, c) in [
+            ("body.md", "Notes on #rust/async.\n"),
+            ("fm.md", "---\ntags: '#rust, mcp'\n---\nx\n"),
+            ("none.md", "---\ntags: [go]\n---\n`#rust`\n"),
+        ] {
+            fs::write(v.join(p), c).unwrap();
+        }
+        let mut db = Db::open(&d.path().join("vlt.db"), &IndexMeta { model_id: "fake".into(), dim: 384, fingerprint: "fake".into(), vault: "v".into() }).unwrap();
+        let src = || -> crate::Result<Arc<dyn crate::ml::Embedder>> { Ok(Arc::new(FakeEmbedder)) };
+        reindex(db.conn_mut(), &v, &build_exclude(&[]).unwrap(), &src, &mut |_, _| {}).unwrap();
+        let paths = |w: Value| load_filtered_paths(db.conn(), &Filter::new(Some(&w), None).unwrap()).unwrap();
+        assert_eq!(paths(json!({"tags": "rust"})), vec!["body.md", "fm.md"], "nested body tag and a split frontmatter string");
+        assert_eq!(paths(json!({"tags": "mcp"})), vec!["fm.md"]);
+        assert_eq!(paths(json!({"tags": "go"})), vec!["none.md"], "a tag in code is not a tag");
+    }
 
     #[test]
     fn fts_query_escapes_terms_and_joins_with_or() {

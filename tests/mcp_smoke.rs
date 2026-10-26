@@ -50,13 +50,19 @@ fn mcp_lists_and_calls_tools() {
     assert_eq!(schema("get")["required"], json!(["path"]));
     assert!(schema("properties")["properties"]["path_prefix"].is_object());
     assert!(schema("properties")["properties"]["key"].is_object());
+    assert!(schema("properties")["properties"]["where"].is_object());
+    assert!(schema("folders")["properties"]["path_prefix"].is_object());
+    assert!(schema("audit")["properties"]["path_prefix"].is_object());
+    assert_eq!(schema("related")["required"], json!(["path"]));
+    assert_eq!(schema("related")["properties"]["limit"]["minimum"], json!(1));
     let mut names: Vec<String> = tools
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
     names.sort();
-    assert_eq!(names, vec!["edit", "get", "properties", "reindex", "search", "update_properties"]);
+    assert_eq!(names, vec!["audit", "create", "edit", "folders", "get", "properties", "reindex", "related", "search", "update_properties"]);
     assert_eq!(schema("edit")["required"], json!(["path", "old_text", "new_text"]));
+    assert_eq!(schema("create")["required"], json!(["path", "content"]));
     assert_eq!(schema("update_properties")["required"], json!(["path"]));
     assert!(schema("update_properties")["properties"]["unset"].is_object());
 
@@ -226,6 +232,9 @@ fn cli_json_is_the_mcp_text_block_byte_for_byte() {
         (vec!["search", "sqlite concurrent readers", "--json"], "search", json!({"query": "sqlite concurrent readers"})),
         (vec!["get", "db.md", "--json"], "get", json!({"path": "db.md"})),
         (vec!["properties", "--json"], "properties", json!({})),
+        (vec!["folders", "--json"], "folders", json!({})),
+        (vec!["related", "db.md", "--json"], "related", json!({"path": "db.md"})),
+        (vec!["audit", "--json"], "audit", json!({})),
     ];
     let expected: Vec<String> = cases.iter().map(|(args, _, _)| cli(args)).collect();
     let mut s = Server::start(&home);
@@ -271,6 +280,15 @@ fn mcp_enrichment_round_trip() {
     assert_eq!(r["structuredContent"]["error"]["code"], "invalid_arguments");
     let r = s.call("edit", json!({"path": "../x.md", "old_text": "a", "new_text": "b"}));
     assert_eq!(r["structuredContent"]["error"]["code"], "path_outside_vault");
+
+    let r = s.call("create", json!({"path": "ideas/wal.md", "content": "# WAL notes\n\nSee [[db]].\n"}));
+    assert_ne!(r["isError"], true, "{r}");
+    assert_eq!(r["structuredContent"]["reindexed"], true);
+    let r = s.call("get", json!({"path": "db.md"}));
+    let backlinks = r["structuredContent"]["backlinks"].as_array().unwrap();
+    assert!(backlinks.iter().any(|b| b["path"] == "ideas/wal.md"), "the created note links db: {backlinks:?}");
+    let r = s.call("create", json!({"path": "ideas/wal.md", "content": "again\n"}));
+    assert_eq!(r["structuredContent"]["error"]["code"], "already_exists");
     s.stop();
 
     let notes = std::fs::read_to_string(vault.join("notes.md")).unwrap();

@@ -4,11 +4,13 @@ use clap::{Parser, Subcommand};
 use serde_json::Value;
 
 use crate::app::App;
-use crate::documents::{DocumentResponse, PropertiesResponse};
+use crate::audit::{AuditResponse, Section};
+use crate::documents::{DocumentResponse, FoldersResponse, PropertiesResponse};
 use crate::installer::models::{missing, pull_showing_progress};
 use crate::installer::{InstallOptions, Target};
 use crate::ml::models::Models;
 use crate::paths;
+use crate::related::RelatedResponse;
 use crate::search::filter::parse_cli_where;
 use crate::search::{SearchRequest, SearchResponse};
 use crate::{Result, VltError};
@@ -70,12 +72,44 @@ enum Command {
     },
     /// List frontmatter properties with their types and top values
     Properties {
+        /// Only documents matching `<key><op><value>`, op one of =, >, >=, <, <= (repeatable)
+        #[arg(long = "where")]
+        where_: Vec<String>,
         /// Only documents whose vault-relative path starts with this prefix
         #[arg(long)]
         path_prefix: Option<String>,
         /// Only this property, with every value instead of the top ones
         #[arg(long)]
         key: Option<String>,
+        /// Print the same JSON the MCP tool returns
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the vault's folders with their notes and most used keys
+    Folders {
+        /// Only folders whose vault-relative path starts with this prefix
+        #[arg(long)]
+        path_prefix: Option<String>,
+        /// Print the same JSON the MCP tool returns
+        #[arg(long)]
+        json: bool,
+    },
+    /// Report spelling variants, rare keys, folder gaps, broken links and unlinked notes
+    Audit {
+        /// Only notes whose vault-relative path starts with this prefix
+        #[arg(long)]
+        path_prefix: Option<String>,
+        /// Print the same JSON the MCP tool returns
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the notes related to a note, the tags they share and the sections that mention it unlinked
+    Related {
+        /// Vault-relative path of the note
+        path: String,
+        /// Maximum number of related notes (default 10)
+        #[arg(long)]
+        limit: Option<usize>,
         /// Print the same JSON the MCP tool returns
         #[arg(long)]
         json: bool,
@@ -163,13 +197,41 @@ fn dispatch(cmd: Command) -> Result<()> {
                 write_out(format_args!("{}", render_document(&app, &doc)))
             }
         }
-        Command::Properties { path_prefix, key, json } => {
+        Command::Properties { where_, path_prefix, key, json } => {
+            let where_ = if where_.is_empty() { None } else { Some(parse_cli_where(&where_)?) };
             let app = App::load()?;
-            let resp = app.list_properties(path_prefix.as_deref(), key.as_deref())?;
+            let resp = app.list_properties(where_.as_ref(), path_prefix.as_deref(), key.as_deref())?;
             if json {
                 print_json(&resp)
             } else {
                 write_out(format_args!("{}", render_properties(&resp)))
+            }
+        }
+        Command::Folders { path_prefix, json } => {
+            let app = App::load()?;
+            let resp = app.list_folders(path_prefix.as_deref())?;
+            if json {
+                print_json(&resp)
+            } else {
+                write_out(format_args!("{}", render_folders(&resp)))
+            }
+        }
+        Command::Audit { path_prefix, json } => {
+            let app = App::load()?;
+            let resp = app.audit(path_prefix.as_deref())?;
+            if json {
+                print_json(&resp)
+            } else {
+                write_out(format_args!("{}", render_audit(&resp)))
+            }
+        }
+        Command::Related { path, limit, json } => {
+            let app = App::load()?;
+            let resp = app.related(&path, limit)?;
+            if json {
+                print_json(&resp)
+            } else {
+                write_out(format_args!("{}", render_related(&resp)))
             }
         }
         Command::Reindex { force } => {
@@ -248,33 +310,108 @@ fn render_document(app: &App, doc: &DocumentResponse) -> String {
 fn render_properties(resp: &PropertiesResponse) -> String {
     let header = ["KEY".to_string(), "TYPE".to_string(), "DOCS".to_string(), "TOP VALUES".to_string()];
     let mut rows = vec![header];
+    let item = |(v, n): &(Value, usize)| match v {
+        Value::String(s) => format!("{s} ({n})"),
+        other => format!("{other} ({n})"),
+    };
     for p in &resp.properties {
-        let top: Vec<String> = p
-            .top_values
-            .iter()
-            .map(|(v, n)| match v {
-                Value::String(s) => format!("{s} ({n})"),
-                other => format!("{other} ({n})"),
-            })
-            .collect();
+        let top: Vec<String> = p.top_values.iter().map(item).collect();
         rows.push([p.key.clone(), p.kind.clone(), p.documents.to_string(), top.join(", ")]);
     }
     let width = |i: usize| rows.iter().map(|r| r[i].chars().count()).max().unwrap_or(0);
     let widths = [width(0), width(1), width(2)];
-    rows.iter()
-        .map(|r| {
-            format!(
-                "{:w0$}  {:w1$}  {:w2$}  {}\n",
-                r[0],
-                r[1],
-                r[2],
-                r[3],
-                w0 = widths[0],
-                w1 = widths[1],
-                w2 = widths[2]
-            )
-        })
-        .collect()
+    let mut out = String::new();
+    for (i, r) in rows.iter().enumerate() {
+        out.push_str(&format!("{:w0$}  {:w1$}  {:w2$}  {}\n", r[0], r[1], r[2], r[3], w0 = widths[0], w1 = widths[1], w2 = widths[2]));
+        // `rows[0]` is the header; `resp.properties[i - 1]` owns row `i`.
+        if let Some(p) = i.checked_sub(1).map(|j| &resp.properties[j]).filter(|p| !p.variants.is_empty()) {
+            let groups: Vec<String> = p.variants.iter().map(|g| g.iter().map(item).collect::<Vec<_>>().join(" / ")).collect();
+            out.push_str(&format!("  variants: {}\n", groups.join("; ")));
+        }
+    }
+    out
+}
+
+fn render_folders(resp: &FoldersResponse) -> String {
+    let mut rows = vec![["FOLDER".to_string(), "DOCS".to_string(), "TOTAL".to_string(), "TOP KEYS".to_string()]];
+    for f in &resp.folders {
+        let keys: Vec<String> = f.top_keys.iter().map(|(k, n)| format!("{k} ({n})")).collect();
+        let path = if f.path.is_empty() { "/".to_string() } else { f.path.clone() };
+        rows.push([path, f.documents.to_string(), f.total.to_string(), keys.join(", ")]);
+    }
+    let width = |i: usize| rows.iter().map(|r| r[i].chars().count()).max().unwrap_or(0);
+    let widths = [width(0), width(1), width(2)];
+    let mut out = String::new();
+    for r in &rows {
+        out.push_str(&format!("{:w0$}  {:w1$}  {:w2$}  {}\n", r[0], r[1], r[2], r[3], w0 = widths[0], w1 = widths[1], w2 = widths[2]));
+    }
+    out
+}
+
+fn render_audit(resp: &AuditResponse) -> String {
+    let value = |(v, n): &(Value, usize)| match v {
+        Value::String(s) => format!("{s} ({n})"),
+        other => format!("{other} ({n})"),
+    };
+    let mut out = String::new();
+    fn section<T>(out: &mut String, name: &str, s: &Section<T>, line: impl Fn(&T) -> String) {
+        if s.total == 0 {
+            return;
+        }
+        if s.items.len() < s.total {
+            out.push_str(&format!("{name} ({} of {})\n", s.items.len(), s.total));
+        } else {
+            out.push_str(&format!("{name} ({})\n", s.total));
+        }
+        for item in &s.items {
+            out.push_str(&format!("  {}\n", line(item)));
+        }
+    }
+    section(&mut out, "value variants", &resp.value_variants, |v| {
+        let spellings: Vec<String> = v.spellings.iter().map(value).collect();
+        format!("{}: {}", v.key, spellings.join(" / "))
+    });
+    section(&mut out, "rare keys", &resp.rare_keys, |r| format!("{}  {}", r.key, r.path));
+    section(&mut out, "key variants", &resp.key_variants, |k| {
+        let keys: Vec<String> = k.keys.iter().map(|(key, n)| format!("{key} ({n})")).collect();
+        keys.join(" / ")
+    });
+    section(&mut out, "folder gaps", &resp.folder_gaps, |g| {
+        let folder = if g.folder.is_empty() { "/" } else { &g.folder };
+        format!("{folder}  {} {}  {}/{}  missing: {}", g.kind, g.name, g.present, g.notes, g.missing.join(", "))
+    });
+    section(&mut out, "broken links", &resp.broken_links, |l| format!("{}:{}  {}  {}", l.path, l.line, l.raw, l.status));
+    section(&mut out, "orphans", &resp.orphans, |n| n.path.clone());
+    section(&mut out, "no outgoing links", &resp.no_outgoing, |n| n.path.clone());
+    if out.is_empty() {
+        out.push_str("nothing to report\n");
+    }
+    out
+}
+
+fn render_related(resp: &RelatedResponse) -> String {
+    let heading = |id: &str, path: &str| id.strip_prefix(path).and_then(|r| r.strip_prefix('#')).unwrap_or(id).to_string();
+    let mut rows = vec![["NOTE".to_string(), "SCORE".to_string(), "LINKED".to_string(), "SECTIONS".to_string()]];
+    for n in &resp.notes {
+        rows.push([n.path.clone(), format!("{:.2}", n.score), n.linked.to_string(), format!("{} → {}", heading(&n.from, &resp.path), heading(&n.to, &n.path))]);
+    }
+    let width = |i: usize| rows.iter().map(|r| r[i].chars().count()).max().unwrap_or(0);
+    let widths = [width(0), width(1), width(2)];
+    let mut out = String::new();
+    for r in &rows {
+        out.push_str(&format!("{:w0$}  {:w1$}  {:w2$}  {}\n", r[0], r[1], r[2], r[3], w0 = widths[0], w1 = widths[1], w2 = widths[2]));
+    }
+    if !resp.suggested_tags.is_empty() {
+        let tags: Vec<String> = resp.suggested_tags.iter().map(|(t, n)| format!("{t} ({n})")).collect();
+        out.push_str(&format!("suggested tags: {}\n", tags.join(", ")));
+    }
+    if !resp.mentions.is_empty() {
+        out.push_str("mentions:\n");
+        for m in &resp.mentions {
+            out.push_str(&format!("  {}:{}  {}\n", m.path, m.line, m.name));
+        }
+    }
+    out
 }
 
 /// Downloads the configured models that are not on disk yet; progress goes to stderr.

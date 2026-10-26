@@ -1,4 +1,5 @@
 pub mod app;
+pub mod audit;
 pub mod cli;
 pub mod config;
 pub mod documents;
@@ -9,6 +10,7 @@ pub mod links;
 pub mod mcp;
 pub mod ml;
 pub mod paths;
+pub mod related;
 pub mod search;
 pub mod storage;
 pub mod write;

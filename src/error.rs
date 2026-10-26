@@ -26,6 +26,8 @@ pub enum VltError {
     FileChanged,
     #[error("invalid frontmatter: {0}; ask the user to fix it first")]
     InvalidFrontmatter(String),
+    #[error("{0} already exists; choose another path, or process that note")]
+    AlreadyExists(String),
 }
 
 impl VltError {
@@ -39,6 +41,7 @@ impl VltError {
             VltError::Ambiguous(_) => "ambiguous",
             VltError::FileChanged => "file_changed",
             VltError::InvalidFrontmatter(_) => "invalid_frontmatter",
+            VltError::AlreadyExists(_) => "already_exists",
             _ => "internal",
         }
     }
@@ -61,5 +64,6 @@ mod tests {
         assert_eq!(VltError::Ambiguous(2).code(), "ambiguous");
         assert_eq!(VltError::FileChanged.code(), "file_changed");
         assert_eq!(VltError::InvalidFrontmatter("x".into()).code(), "invalid_frontmatter");
+        assert_eq!(VltError::AlreadyExists("x".into()).code(), "already_exists");
     }
 }

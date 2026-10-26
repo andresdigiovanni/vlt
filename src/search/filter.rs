@@ -74,10 +74,11 @@ fn scalar_eq(a: &Value, b: &Value) -> bool {
     }
 }
 
-/// `prop` is the tag `wanted` or one nested under it (`project` and `project/` match `project/vlt`).
+/// `prop` is the tag `wanted` or one nested under it (`project`, `project/` and `#project` match `project/vlt`).
 fn tag_eq(prop: &Value, wanted: &Value) -> bool {
     match (prop, wanted) {
         (Value::String(p), Value::String(w)) => {
+            let w = w.strip_prefix('#').unwrap_or(w);
             let (p, w) = (p.to_lowercase(), w.trim_end_matches('/').to_lowercase());
             p.strip_prefix(&w).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
         }
@@ -259,6 +260,14 @@ mod tests {
         assert!(m(json!({"tags": "project/"}), json!({"tags": ["project/vlt"]})));
         assert!(m(json!({"tags": "project/"}), json!({"tags": ["project"]})));
         assert!(!m(json!({"tags": "proj/"}), json!({"tags": ["project/vlt"]})));
+    }
+
+    #[test]
+    fn a_leading_hash_on_a_tag_filter_is_ignored() {
+        assert!(m(json!({"tags": "#rust"}), json!({"tags": ["rust"]})));
+        assert!(m(json!({"tags": "#project"}), json!({"tags": ["project/vlt"]})), "nested matching still applies");
+        assert!(!m(json!({"tags": "##rust"}), json!({"tags": ["rust"]})), "only one `#` is dropped");
+        assert!(!m(json!({"status": "#done"}), json!({"status": "done"})), "other keys match exact values");
     }
 
     #[test]

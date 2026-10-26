@@ -93,6 +93,130 @@ fn properties_with_a_key_lists_only_that_key_with_every_value() {
 }
 
 #[test]
+fn properties_where_counts_only_the_selected_notes() {
+    let e = Env::new();
+    let v = e.json(&["properties", "--where", "tags=rust", "--json"]);
+    assert_eq!(v["properties"][0]["top_values"], serde_json::json!([["db", 1], ["rust", 1]]), "{v}");
+}
+
+#[test]
+fn folders_lists_each_folder_with_its_notes_and_top_keys() {
+    let e = Env::new();
+    fs::write(e.vault().join("projects/extra.md"), "---\nstatus: x\n---\nx\n").unwrap();
+    let out = e.cmd().arg("folders").output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "FOLDER     DOCS  TOTAL  TOP KEYS\n/          1     3      tags (1)\nprojects/  2     2      status (1), tags (1)\n"
+    );
+    let v = e.json(&["folders", "--path-prefix", "projects/", "--json"]);
+    assert_eq!(v, serde_json::json!({"folders": [{"path": "projects/", "documents": 2, "total": 2, "top_keys": [["status", 1], ["tags", 1]]}]}));
+}
+
+#[test]
+fn audit_text_lists_each_section_with_its_lines() {
+    let e = Env::new();
+    let v = e.vault();
+    fs::write(v.join("a.md"), "---\nRepo-Role: x\n---\nSee [[gone]] and [[db]].\n").unwrap();
+    fs::write(v.join("b.md"), "---\nrepo_role: y\n---\nx\n").unwrap();
+    fs::write(v.join("c.md"), "---\ntags: [Rust]\n---\nc\n").unwrap();
+    fs::create_dir_all(v.join("g")).unwrap();
+    for i in 1..=5 {
+        let fm = if i < 5 { "---\nstatus: done\n---\n" } else { "" };
+        fs::write(v.join(format!("g/{i}.md")), format!("{fm}g{i}\n")).unwrap();
+    }
+    let out = e.cmd().arg("audit").output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8_lossy(&out.stdout);
+    for block in [
+        "value variants (1)\n  tags: Rust (1) / rust (1)\n",
+        "rare keys (2)\n  Repo-Role  a.md\n  repo_role  b.md\n",
+        "key variants (1)\n  Repo-Role (1) / repo_role (1)\n",
+        "folder gaps (1)\n  g/  key status  4/5  missing: g/5.md\n",
+        "broken links (1)\n  a.md:4  [[gone]]  broken\n",
+        "orphans (",
+        "no outgoing links (",
+    ] {
+        assert!(text.contains(block), "{block:?} not in\n{text}");
+    }
+}
+
+#[test]
+fn audit_caps_sections_and_says_when_there_is_nothing_to_report() {
+    let e = Env::new();
+    let v = e.vault();
+    fs::write(v.join("projects/db.md"), "See [[notes]].\n").unwrap();
+    fs::write(v.join("notes.md"), "See [[db]].\n").unwrap();
+    let out = e.cmd().arg("audit").output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "nothing to report\n");
+    for i in 0..60 {
+        fs::write(v.join(format!("o{i:02}.md")), "x\n").unwrap();
+    }
+    let out = e.cmd().arg("audit").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("orphans (50 of 60)\n  o00.md\n"), "{text}");
+    let json = e.json(&["audit", "--json"]);
+    assert_eq!((json["orphans"]["total"].as_u64(), json["orphans"]["items"].as_array().unwrap().len()), (Some(60), 50));
+}
+
+#[test]
+fn audit_text_shows_the_root_folder_as_a_slash_and_lists_every_note_line() {
+    let e = Env::new();
+    for i in 1..=4 {
+        fs::write(e.vault().join(format!("r{i}.md")), "---\ntype: x\n---\nr\n").unwrap();
+    }
+    let out = e.cmd().arg("audit").output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8_lossy(&out.stdout);
+    for block in [
+        "folder gaps (1)\n  /  key type  4/5  missing: notes.md\n",
+        "orphans (5)\n  notes.md\n  r1.md\n  r2.md\n  r3.md\n  r4.md\n",
+        "no outgoing links (5)\n  projects/db.md\n  r1.md\n  r2.md\n  r3.md\n  r4.md\n",
+    ] {
+        assert!(text.contains(block), "{block:?} not in\n{text}");
+    }
+}
+
+#[test]
+fn related_lists_the_closest_notes_with_their_link_state() {
+    let e = Env::new();
+    let v = e.json(&["related", "projects/db.md", "--json"]);
+    assert_eq!(v["path"], "projects/db.md");
+    assert_eq!(v["notes"][0]["path"], "notes.md");
+    assert_eq!(v["notes"][0]["linked"], "from", "notes.md links to db");
+    assert_eq!(v["mentions"], serde_json::json!([]));
+    let out = e.cmd().args(["related", "projects/db.md", "--limit", "1"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = text.lines();
+    assert!(lines.next().unwrap().starts_with("NOTE      SCORE  LINKED  SECTIONS"), "{text}");
+    let row = lines.next().unwrap();
+    assert!(row.starts_with("notes.md  ") && row.contains("  from    ") && row.contains(" → Pasta"), "{text}");
+    assert_eq!(lines.next(), None, "no suggested tags or mentions here");
+    let bad = e.cmd().args(["related", "projects/db.md", "--limit", "0"]).output().unwrap();
+    assert!(!bad.status.success());
+}
+
+#[test]
+fn related_text_lists_suggested_tags_mentions_and_paths_with_a_hash() {
+    let e = Env::new();
+    fs::write(e.vault().join("a.md"), "---\ntags: [sql]\n---\nStorage notes about sqlite wal.\n").unwrap();
+    fs::write(e.vault().join("b.md"), "---\ntags: [sql]\n---\nMore storage on sqlite readers.\n").unwrap();
+    fs::create_dir_all(e.vault().join("C#")).unwrap();
+    fs::write(e.vault().join("C#/basics.md"), "# Types\nSQLite WAL mode allows concurrent readers.\n").unwrap();
+    let out = e.cmd().args(["related", "projects/db.md"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("suggested tags: sql (2)\n"), "{text}");
+    assert!(text.contains("mentions:\n  a.md:4  Storage\n  b.md:4  Storage\n"), "{text}");
+    let row = text.lines().find(|l| l.starts_with("C#/basics.md")).expect("C#/basics.md is related");
+    assert!(row.ends_with("Concurrency → Types"), "{row}");
+    let bad = e.cmd().args(["related", "projects/db.md", "--limit", "0"]).output().unwrap();
+    assert_eq!(bad.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&bad.stderr), "error: limit must be at least 1\n");
+}
+
+#[test]
 fn vault_change_requires_rebuild_until_reindex() {
     let e = Env::new();
     e.json(&["search", "sqlite", "--json"]);
@@ -276,6 +400,18 @@ fn properties_human_output_exact_format() {
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         "KEY   TYPE  DOCS  TOP VALUES\ntags  list  2     cooking (1), db (1), rust (1)\n"
+    );
+}
+
+#[test]
+fn properties_text_output_lists_variants_under_their_key() {
+    let e = Env::new();
+    fs::write(e.vault().join("extra.md"), "Uses #Rust and #DB.\n").unwrap();
+    let out = e.cmd().arg("properties").output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "KEY   TYPE  DOCS  TOP VALUES\ntags  list  3     DB (1), Rust (1), cooking (1), db (1), rust (1)\n  variants: DB (1) / db (1); Rust (1) / rust (1)\n"
     );
 }
 

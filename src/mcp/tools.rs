@@ -8,7 +8,7 @@ use crate::app::App;
 use crate::search::SearchRequest;
 use crate::VltError;
 
-const INSTRUCTIONS: &str = "vlt: search the user's markdown knowledge base (hybrid search), read documents, inspect properties and, when the user approves, edit documents and their properties. Read and write the vault only through these tools.";
+const INSTRUCTIONS: &str = "vlt: search the user's markdown knowledge base (hybrid search), read documents, inspect properties and, when the user approves, create notes and edit documents and their properties. Read and write the vault only through these tools.";
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct SearchArgs {
@@ -35,10 +35,35 @@ struct GetArgs {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct PropertiesArgs {
+    /// Property filter selecting the documents counted, as in `search`, e.g. {"type": "project"}.
+    #[serde(default, rename = "where")]
+    #[schemars(schema_with = "object_or_string_schema")]
+    where_: Option<Value>,
     /// Only documents whose vault-relative path starts with this prefix.
     path_prefix: Option<String>,
     /// Only this property, with every value instead of the most frequent ones.
     key: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct FoldersArgs {
+    /// Only folders whose vault-relative path starts with this prefix.
+    path_prefix: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct AuditArgs {
+    /// Only notes whose vault-relative path starts with this prefix.
+    path_prefix: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct RelatedArgs {
+    /// Vault-relative path of the note.
+    path: String,
+    /// Maximum number of related notes (default 10).
+    #[schemars(range(min = 1))]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -49,6 +74,14 @@ struct EditArgs {
     old_text: String,
     /// Replacement text.
     new_text: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct CreateArgs {
+    /// Vault-relative path of the new note, ending in `.md`.
+    path: String,
+    /// The whole file, frontmatter included, exactly as the user approved it.
+    content: String,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -171,7 +204,7 @@ impl VltServer {
     }
 
     #[tool(
-        description = "Full document at a vault-relative path: properties, content (the text `edit` matches against), sections, outgoing links with their status (ok, broken, ambiguous) and backlinks.",
+        description = "Full document at a vault-relative path: properties (the frontmatter as written), tags (frontmatter and body `#tags`), content (the text `edit` matches against), sections, outgoing links, in the body or in a property (`property`), with their status (ok, broken, ambiguous) and backlinks.",
         input_schema = input_schema::<GetArgs>()
     )]
     async fn get(&self, args: JsonObject) -> Result<CallToolResult, ErrorData> {
@@ -183,7 +216,7 @@ impl VltServer {
     }
 
     #[tool(
-        description = "Inventory of the vault's properties: per key the inferred type, the number of documents using it and its most frequent values (every value with `key`). Call it before filtering by, or setting, a property so you reuse the existing keys and values.",
+        description = "Inventory of the vault's properties: per key the inferred type, the number of documents using it and its most frequent values (every value with `key`). `where` (as in `search`) selects the documents counted. `variants` groups spellings of one value that differ only in case or `-`, `_` and spaces. `tags` counts frontmatter and body `#tags`. Call it before filtering by, or setting, a property so you reuse the existing keys and values.",
         input_schema = input_schema::<PropertiesArgs>()
     )]
     async fn properties(&self, args: JsonObject) -> Result<CallToolResult, ErrorData> {
@@ -191,7 +224,44 @@ impl VltServer {
             Ok(a) => a,
             Err(e) => return Ok(tool_error(&e)),
         };
-        Ok(self.call(move |app| app.list_properties(a.path_prefix.as_deref(), a.key.as_deref())).await)
+        let where_ = a.where_.map(coerce_stringified_json);
+        Ok(self.call(move |app| app.list_properties(where_.as_ref(), a.path_prefix.as_deref(), a.key.as_deref())).await)
+    }
+
+    #[tool(
+        description = "The vault's folders: per folder its notes (`documents` directly in it, `total` with its subfolders) and its 5 most used property keys. The root is \"\"; other folders end in `/`, the form `path_prefix` takes. Use it to see where notes of a kind live before drafting one.",
+        input_schema = input_schema::<FoldersArgs>()
+    )]
+    async fn folders(&self, args: JsonObject) -> Result<CallToolResult, ErrorData> {
+        let a = match parse_args::<FoldersArgs>(args) {
+            Ok(a) => a,
+            Err(e) => return Ok(tool_error(&e)),
+        };
+        Ok(self.call(move |app| app.list_folders(a.path_prefix.as_deref())).await)
+    }
+
+    #[tool(
+        description = "Health report of the vault (or of the notes under `path_prefix`): `value_variants` (spellings of one value), `rare_keys` (keys one note has), `key_variants` (keys differing only in case or separators; both with the `notes` to change), `folder_gaps` (keys and tags on most but not all of a folder's notes, with the notes missing them), `broken_links`, `orphans` (notes nobody links) and `no_outgoing` (notes linking nowhere). Each section has `total` and at most 50 `items`. Use it to propose fixes across notes.",
+        input_schema = input_schema::<AuditArgs>()
+    )]
+    async fn audit(&self, args: JsonObject) -> Result<CallToolResult, ErrorData> {
+        let a = match parse_args::<AuditArgs>(args) {
+            Ok(a) => a,
+            Err(e) => return Ok(tool_error(&e)),
+        };
+        Ok(self.call(move |app| app.audit(a.path_prefix.as_deref())).await)
+    }
+
+    #[tool(
+        description = "Notes related to a note: the closest notes by meaning, each with the section of this note it matches (`from`), its own section (`to`), `linked` (to, from, both, none) and its tags; `suggested_tags`, the tags two or more of the closest of them carry and this note lacks; and `mentions`, sections of other notes that name this note (title, alias or file name) without a link. Use it before proposing links or tags.",
+        input_schema = input_schema::<RelatedArgs>()
+    )]
+    async fn related(&self, args: JsonObject) -> Result<CallToolResult, ErrorData> {
+        let a = match parse_args::<RelatedArgs>(args) {
+            Ok(a) => a,
+            Err(e) => return Ok(tool_error(&e)),
+        };
+        Ok(self.call(move |app| app.related(&a.path, a.limit)).await)
     }
 
     #[tool(description = "Detects changes in the vault (files edited outside vlt) and reindexes them incrementally. Other tools already do this before reading.")]
@@ -209,6 +279,18 @@ impl VltServer {
             Err(e) => return Ok(tool_error(&e)),
         };
         Ok(self.call(move |app| app.edit(&a.path, &a.old_text, &a.new_text)).await)
+    }
+
+    #[tool(
+        description = "Creates a new note at a vault-relative `.md` path with `content`, the whole file (frontmatter included), creating missing folders. Never overwrites: a path that exists is `already_exists`; a path the configuration excludes is rejected. Only call it for a draft the user approved.",
+        input_schema = input_schema::<CreateArgs>()
+    )]
+    async fn create(&self, args: JsonObject) -> Result<CallToolResult, ErrorData> {
+        let a = match parse_args::<CreateArgs>(args) {
+            Ok(a) => a,
+            Err(e) => return Ok(tool_error(&e)),
+        };
+        Ok(self.call(move |app| app.create(&a.path, &a.content)).await)
     }
 
     #[tool(

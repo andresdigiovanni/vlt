@@ -1,6 +1,8 @@
 //! Markdown parsing: frontmatter, ATX headings and links.
 
 use serde_json::{Map, Value};
+use crate::write::frontmatter::key_of;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkKind {
@@ -47,6 +49,8 @@ pub struct RawLink {
     /// Exact source text of the link.
     pub raw: String,
     pub line: usize,
+    /// The top-level frontmatter key the link is in; `None` for a link in the body.
+    pub property: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -60,6 +64,8 @@ pub struct ParsedDoc {
     pub body_start_line: usize,
     pub headings: Vec<Heading>,
     pub links: Vec<RawLink>,
+    /// Frontmatter `tags`, then body `#tags`, deduplicated case-insensitively (first spelling kept).
+    pub tags: Vec<String>,
 }
 
 pub fn parse(text: &str, file_stem: &str) -> ParsedDoc {
@@ -70,6 +76,10 @@ pub fn parse(text: &str, file_stem: &str) -> ParsedDoc {
 
     let mut headings: Vec<Heading> = Vec::new();
     let mut links = Vec::new();
+    if let Some(p) = &properties {
+        frontmatter_links(&text, p, body_start_line, &mut links);
+    }
+    let mut body_tags = Vec::new();
     let mut stack: Vec<(u8, String)> = Vec::new();
     let mut fence: Option<(u8, usize)> = None;
 
@@ -98,6 +108,7 @@ pub fn parse(text: &str, file_stem: &str) -> ParsedDoc {
             });
         }
         scan_links(line, line_no, &mut links);
+        scan_tags(line, &mut body_tags);
     }
 
     let title = properties
@@ -113,6 +124,8 @@ pub fn parse(text: &str, file_stem: &str) -> ParsedDoc {
         })
         .unwrap_or_else(|| file_stem.to_string());
 
+    let tags = effective_tags(frontmatter_tags(properties.as_ref()), body_tags);
+
     ParsedDoc {
         properties,
         frontmatter_error,
@@ -121,7 +134,85 @@ pub fn parse(text: &str, file_stem: &str) -> ParsedDoc {
         body_start_line,
         headings,
         links,
+        tags,
     }
+}
+
+/// Obsidian's frontmatter `tags`: a string or a list of strings, each split on commas and whitespace,
+/// each piece cut like a body tag (leading quotes and one `#` dropped, cut at the first non-tag character,
+/// a trailing `/` trimmed); non-string values and empty or all-digit pieces are not tags.
+fn frontmatter_tags(properties: Option<&Map<String, Value>>) -> Vec<String> {
+    let values = match properties.and_then(|p| p.get("tags")) {
+        Some(Value::Array(items)) => items.as_slice(),
+        Some(v) => std::slice::from_ref(v),
+        None => &[],
+    };
+    values
+        .iter()
+        .filter_map(Value::as_str)
+        .flat_map(|s| s.split(|c: char| c == ',' || c.is_whitespace()))
+        .map(|t| {
+            let t = t.trim_start_matches(['"', '\'']);
+            leading_tag(t.strip_prefix('#').unwrap_or(t))
+        })
+        .filter(|t| is_tag(t))
+        .map(str::to_string)
+        .collect()
+}
+
+fn is_tag(t: &str) -> bool {
+    !t.is_empty() && !t.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Letters, digits, `_`, `-`, `/`, and any non-ASCII character but whitespace (emoji, symbols).
+fn is_tag_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '-' | '/') || (!c.is_ascii() && !c.is_whitespace())
+}
+
+/// The tag at the start of `s` (after its `#`): the run of tag characters, a trailing `/` trimmed.
+fn leading_tag(s: &str) -> &str {
+    let len: usize = s.chars().take_while(|&c| is_tag_char(c)).map(char::len_utf8).sum();
+    s[..len].trim_end_matches('/')
+}
+
+/// The `#tags` of one body line, as Obsidian reads them: a `#` at the line start or after whitespace,
+/// outside code spans; a trailing `/` is trimmed.
+fn scan_tags(line: &str, out: &mut Vec<String>) {
+    if !line.contains('#') {
+        return;
+    }
+    let b = line.as_bytes();
+    let mut i = 0;
+    let mut after_space = true;
+    while i < b.len() {
+        match b[i] {
+            b'`' => {
+                let run = b[i..].iter().take_while(|&&c| c == b'`').count();
+                i = skip_code_span(b, i, run);
+                after_space = false;
+            }
+            b'#' if after_space => {
+                let rest = &line[i + 1..];
+                let len: usize = rest.chars().take_while(|&c| is_tag_char(c)).map(char::len_utf8).sum();
+                let tag = leading_tag(rest);
+                if is_tag(tag) {
+                    out.push(tag.to_string());
+                }
+                i += 1 + len;
+                after_space = false;
+            }
+            _ => {
+                let c = line[i..].chars().next().expect("i is on a char boundary");
+                after_space = c.is_whitespace();
+                i += c.len_utf8();
+            }
+        }
+    }
+}
+
+fn effective_tags(frontmatter: Vec<String>, body: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    frontmatter.into_iter().chain(body).filter(|t| seen.insert(t.to_lowercase())).collect()
 }
 
 pub(crate) type Frontmatter = (Option<Map<String, Value>>, Option<String>, String, usize);
@@ -233,6 +324,83 @@ impl Brackets {
     }
 }
 
+/// Links in property values (Obsidian 1.4+), each with the top-level key whose entry holds its line.
+/// Obsidian reads a link only in a quoted string, so a link counts only when a string of its key's value holds it.
+fn frontmatter_links(text: &str, properties: &Map<String, Value>, body_start_line: usize, out: &mut Vec<RawLink>) {
+    let mut key: Option<String> = None;
+    // The YAML is file lines 2..=body_start_line - 2; line index i is file line i + 1.
+    for (i, line) in text.split('\n').enumerate().take(body_start_line - 2).skip(1) {
+        if let Some((k, _)) = key_of(line) {
+            key = Some(k);
+        }
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        let Some((k, value)) = key.as_ref().and_then(|k| properties.get(k).map(|v| (k, v))) else {
+            continue;
+        };
+        let mut found = Vec::new();
+        scan_links(line, i + 1, &mut found);
+        out.extend(
+            found.into_iter().filter(|l| holds_text(value, &l.raw)).map(|l| RawLink { property: Some(k.clone()), ..l }),
+        );
+    }
+}
+
+/// Whether a string in `value`, or in a list at any depth, contains `raw`.
+fn holds_text(value: &Value, raw: &str) -> bool {
+    match value {
+        Value::String(s) => s.contains(raw),
+        Value::Array(items) => items.iter().any(|v| holds_text(v, raw)),
+        _ => false,
+    }
+}
+
+/// `line` with its links (`[[…]]`, `![[…]]`, `[…](…)`) and code spans replaced by spaces, byte for byte:
+/// the prose a mention can be in.
+pub(crate) fn prose(line: &str) -> String {
+    if !line.contains(['[', '`']) {
+        return line.to_string();
+    }
+    let brackets = Brackets::new(line);
+    let b = line.as_bytes();
+    let mut out = b.to_vec();
+    let mut scratch = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        // (end, matched): a scanner that found nothing returns its failure index.
+        let (end, matched) = match b[i] {
+            b'`' => {
+                let run = b[i..].iter().take_while(|&&c| c == b'`').count();
+                let end = skip_code_span(b, i, run);
+                (end, end != i + run)
+            }
+            b'!' if line[i..].starts_with("![[") => {
+                let end = wiki_link(line, &brackets, i, 3, LinkKind::Embed, 0, &mut scratch);
+                (end, end != i + 1)
+            }
+            b'[' if line[i..].starts_with("[[") => {
+                let end = wiki_link(line, &brackets, i, 2, LinkKind::Wiki, 0, &mut scratch);
+                (end, end != i + 1)
+            }
+            b'!' if line[i..].starts_with("![") => {
+                let end = markdown_link(line, &brackets, i, i + 1, 0, &mut scratch);
+                (end, end != i + 2)
+            }
+            b'[' => {
+                let end = markdown_link(line, &brackets, i, i, 0, &mut scratch);
+                (end, end != i + 1)
+            }
+            _ => (i + 1, false),
+        };
+        if matched {
+            out[i..end].fill(b' ');
+        }
+        i = end;
+    }
+    String::from_utf8(out).expect("only whole ASCII-delimited spans are blanked")
+}
+
 fn scan_links(line: &str, line_no: usize, out: &mut Vec<RawLink>) {
     if !line.contains('[') {
         return;
@@ -313,6 +481,7 @@ fn wiki_link(
         heading: heading.map(str::to_string),
         raw: line[start..end].to_string(),
         line: line_no,
+        property: None,
     });
     end
 }
@@ -403,6 +572,7 @@ fn markdown_link(
                     .map(percent_decode),
                 raw: line[start..end].to_string(),
                 line: line_no,
+                property: None,
             });
         }
     }
@@ -664,5 +834,69 @@ mod tests {
             (LinkKind::Wiki, "[[d]]"),
             (LinkKind::Markdown, "[r `x](r.md)"),
         ]);
+    }
+
+    #[test]
+    fn body_tags_follow_obsidian_rules() {
+        let d = parse("#start and #nested/tag/ mid#no (#paren) #1984 #y1984 #café #🦀 `#code` [[n#heading]] https://e.com/#anchor\n# Heading #inheading\n```\n#fenced\n```\n#tail.\n", "x");
+        assert_eq!(d.tags, vec!["start", "nested/tag", "y1984", "café", "🦀", "inheading", "tail"]);
+    }
+
+    #[test]
+    fn frontmatter_tags_take_every_obsidian_shape() {
+        let tags = |fm: &str| parse(&format!("---\n{fm}\n---\n"), "x").tags;
+        assert_eq!(tags("tags: [rust, '#mcp', 2024, 'a b']"), vec!["rust", "mcp", "a", "b"]);
+        assert_eq!(tags("tags: rust, mcp"), vec!["rust", "mcp"]);
+        assert_eq!(tags("tags: '#rust #mcp'"), vec!["rust", "mcp"]);
+        assert_eq!(tags("tags:\n  - rust\n  - nested/x"), vec!["rust", "nested/x"]);
+        assert!(tags("tag: rust").is_empty(), "the singular key is not read");
+        assert!(tags("tags:").is_empty());
+    }
+
+    #[test]
+    fn frontmatter_tag_pieces_are_cut_like_body_tags() {
+        let tags = |fm: &str| parse(&format!("---\n{fm}\n---\n"), "x").tags;
+        assert_eq!(tags(r##"tags: rust, "#mcp""##), vec!["rust", "mcp"], "a plain YAML string keeps its quotes");
+        assert_eq!(tags(r##"tags: ["'a'", 'b.c', 'd/', '""', 'café🦀']"##), vec!["a", "b", "d", "café🦀"]);
+    }
+
+    #[test]
+    fn effective_tags_put_frontmatter_first_and_drop_case_duplicates() {
+        let d = parse("---\ntags: [Rust, mcp]\n---\nUses #rust and #search, #MCP, #search.\n", "x");
+        assert_eq!(d.tags, vec!["Rust", "mcp", "search"]);
+    }
+
+    #[test]
+    fn frontmatter_links_are_read_from_quoted_values_with_their_key() {
+        let d = parse("---\nup: \"[[parent#Part]]\"\nrelated:\n  - \"[[a]]\"\n  # \"[[commented]]\"\n  - '[b](../b.md)'\nbare: [[not-a-link]]\nn: 3\n---\nBody [[c]].\n", "x");
+        let links: Vec<_> = d.links.iter().map(|l| (l.raw.as_str(), l.line, l.property.as_deref(), l.heading.as_deref())).collect();
+        assert_eq!(links, vec![
+            ("[[parent#Part]]", 2, Some("up"), Some("Part")),
+            ("[[a]]", 4, Some("related"), None),
+            ("[b](../b.md)", 6, Some("related"), None),
+            ("[[c]]", 10, None, None),
+        ], "an unquoted [[x]] is a nested YAML list, not a link; comment lines are skipped");
+    }
+
+    #[test]
+    fn a_frontmatter_that_does_not_parse_as_a_mapping_has_no_links() {
+        for text in ["---\n- \"[[a]]\"\n---\nx\n", "---\nup: \"[[a]]\"\nb: c: d\n---\nx\n"] {
+            let d = parse(text, "x");
+            assert!(d.frontmatter_error.is_some(), "{text:?}");
+            assert!(d.links.is_empty(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn prose_blanks_links_and_code_spans_and_keeps_the_rest() {
+        let words = |line: &str| {
+            let p = prose(line);
+            assert_eq!(p.len(), line.len(), "byte length kept: {line:?}");
+            p.split_whitespace().map(str::to_string).collect::<Vec<_>>()
+        };
+        assert_eq!(words("See [[a|the MCP server]] and ![[b]] or [x](y.md) and `code` here."), vec!["See", "and", "or", "and", "here."]);
+        assert_eq!(words("[x](https://e.com) keeps nothing of the link"), vec!["keeps", "nothing", "of", "the", "link"]);
+        assert_eq!(prose("unclosed [[ and ` stay"), "unclosed [[ and ` stay");
+        assert_eq!(words("café [[ñ]] ok"), vec!["café", "ok"], "UTF-8 stays valid");
     }
 }

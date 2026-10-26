@@ -139,3 +139,128 @@ fn edit_keeps_the_endings_of_untouched_lines_in_a_mixed_file() {
     app.edit("m.md", "three", "THREE").unwrap();
     assert_eq!(std::fs::read(dir.path().join("vault/m.md")).unwrap(), b"one\r\ntwo\nTHREE\r\nfour\n");
 }
+
+#[test]
+fn create_writes_a_new_note_with_its_folders_and_reindexes() {
+    let (dir, app) = app_with(&[("n.md", b"x\n")]);
+    let content = "---\ntags: [new]\n---\n# Fresh\n\nA new note.\n";
+    let r = app.create("ideas/2026/fresh.md", content).unwrap();
+    assert!(r.ok && r.reindexed);
+    assert_eq!(r.path, "ideas/2026/fresh.md");
+    assert_eq!(r.diff, "@@ -1,0 +1,6 @@\n+---\n+tags: [new]\n+---\n+# Fresh\n+\n+A new note.");
+    assert_eq!(std::fs::read_to_string(dir.path().join("vault/ideas/2026/fresh.md")).unwrap(), content);
+    let doc = app.get_document("ideas/2026/fresh.md").unwrap();
+    assert_eq!((doc.title.as_str(), doc.tags.clone()), ("Fresh", vec!["new".to_string()]), "the index has the note");
+    let left: Vec<_> = std::fs::read_dir(dir.path().join("vault/ideas/2026")).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(left, vec!["fresh.md"], "no temp file remains");
+}
+
+#[test]
+fn create_never_replaces_a_file_or_a_folder() {
+    let (dir, app) = app_with(&[("n.md", b"old\n")]);
+    std::fs::create_dir(dir.path().join("vault/dir.md")).unwrap();
+    assert_eq!(app.create("n.md", "new\n").unwrap_err().code(), "already_exists");
+    assert_eq!(app.create("dir.md", "new\n").unwrap_err().code(), "already_exists");
+    assert_eq!(std::fs::read_to_string(dir.path().join("vault/n.md")).unwrap(), "old\n");
+}
+
+#[test]
+fn create_rejects_bad_paths_and_bad_frontmatter_without_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("vault");
+    std::fs::create_dir_all(vault.join("real")).unwrap();
+    std::os::unix::fs::symlink(vault.join("real"), vault.join("link")).unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let mut cfg = Config::parse(&Config::default_toml(&vault)).unwrap();
+    cfg.exclude = vec!["templates/**".into()];
+    let app = App::new(home, cfg, true).unwrap();
+    let code = |p: &str, c: &str| app.create(p, c).unwrap_err().code();
+    assert_eq!(code("../x.md", "x\n"), "path_outside_vault");
+    assert_eq!(code("link/x.md", "x\n"), "path_outside_vault");
+    assert_eq!(code("x.txt", "x\n"), "invalid_arguments");
+    assert_eq!(code("templates/t.md", "x\n"), "invalid_arguments", "vlt could not read an excluded note back");
+    assert_eq!(code("bad.md", "---\n- not a mapping\n---\nx\n"), "invalid_frontmatter");
+    for p in ["templates", "bad.md", "x.txt", "real/x.md"] {
+        assert!(!vault.join(p).exists(), "{p} was written");
+    }
+}
+
+#[test]
+fn create_ignores_a_planted_temp_name_and_never_writes_through_a_symlink() {
+    let (dir, app) = app_with(&[("victim.md", b"keep\n")]);
+    let v = dir.path().join("vault");
+    std::os::unix::fs::symlink(v.join("victim.md"), v.join(".new.md.vlt-tmp")).unwrap();
+    std::os::unix::fs::symlink(v.join("victim.md"), v.join("alias.md")).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("outside.md"), v.join("dangling.md")).unwrap();
+    app.create("new.md", "fresh\n").unwrap();
+    assert_eq!(std::fs::read_to_string(v.join("new.md")).unwrap(), "fresh\n");
+    assert!(!std::fs::symlink_metadata(v.join("new.md")).unwrap().file_type().is_symlink());
+    assert!(app.create("alias.md", "x\n").is_err());
+    assert!(app.create("dangling.md", "x\n").is_err());
+    assert_eq!(std::fs::read_to_string(v.join("victim.md")).unwrap(), "keep\n");
+    assert!(!dir.path().join("outside.md").exists());
+}
+
+#[test]
+fn concurrent_creates_of_one_path_keep_the_winners_content() {
+    for round in 0..20 {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let app = |home: &str| {
+            let home = dir.path().join(home);
+            std::fs::create_dir_all(&home).unwrap();
+            App::new(home, Config::parse(&Config::default_toml(&vault)).unwrap(), true).unwrap()
+        };
+        let (a, b) = (app("h1"), app("h2"));
+        let path = format!("r{round}.md");
+        let (ra, rb) = std::thread::scope(|s| {
+            let ha = s.spawn(|| a.create(&path, "from a\n"));
+            let hb = s.spawn(|| b.create(&path, "from b\n"));
+            (ha.join().unwrap(), hb.join().unwrap())
+        });
+        let on_disk = std::fs::read_to_string(vault.join(&path)).unwrap();
+        match (ra, rb) {
+            (Ok(_), Err(e)) => assert_eq!((on_disk.as_str(), e.code()), ("from a\n", "already_exists")),
+            (Err(e), Ok(_)) => assert_eq!((on_disk.as_str(), e.code()), ("from b\n", "already_exists")),
+            other => panic!("exactly one create must win: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn create_checks_hidden_and_excluded_paths_on_the_folder_it_really_writes_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("vault");
+    std::fs::create_dir_all(vault.join("templates")).unwrap();
+    std::fs::create_dir_all(vault.join("ideas")).unwrap();
+    std::fs::write(vault.join("n.md"), "x\n").unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let mut cfg = Config::parse(&Config::default_toml(&vault)).unwrap();
+    cfg.exclude = vec!["templates/**".into()];
+    let app = App::new(home, cfg, true).unwrap();
+    let code = |p: &str| app.create(p, "x\n").unwrap_err().code();
+    assert_eq!(code(".obsidian/x.md"), "invalid_arguments", "hidden folders are not indexed");
+    assert_eq!(code("sub/.hidden.md"), "invalid_arguments");
+    assert_eq!(code("n.md/x.md"), "invalid_arguments", "a folder in the path is a file");
+    assert!(!vault.join(".obsidian").exists() && !vault.join("sub").exists());
+    if vault.join("TEMPLATES").exists() {
+        // A case-insensitive filesystem: `Templates/` is the excluded `templates/`, and `Ideas/` is `ideas/`.
+        assert_eq!(code("Templates/t.md"), "invalid_arguments");
+        assert!(!vault.join("templates/t.md").exists());
+        let r = app.create("Ideas/x.md", "# X\n").unwrap();
+        assert_eq!(r.path, "ideas/x.md", "the path as stored, which get finds");
+        app.get_document(&r.path).unwrap();
+    }
+}
+
+#[test]
+fn create_checks_the_frontmatter_after_a_bom_and_takes_long_file_names() {
+    let (dir, app) = app_with(&[]);
+    assert_eq!(app.create("b.md", "\u{feff}---\n- a list\n---\nx\n").unwrap_err().code(), "invalid_frontmatter");
+    let long = format!("{}.md", "a".repeat(247));
+    app.create(&long, "x\n").unwrap();
+    assert!(dir.path().join("vault").join(&long).exists());
+}

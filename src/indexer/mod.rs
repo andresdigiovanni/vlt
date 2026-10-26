@@ -114,6 +114,7 @@ fn prepare_many(
             sha256: sha,
             title: doc.title.clone(),
             properties: doc.properties.clone(),
+            tags: doc.tags.clone(),
             frontmatter_error: doc.frontmatter_error.clone(),
         };
         out.push(PreparedFile { file, chunks, doc });

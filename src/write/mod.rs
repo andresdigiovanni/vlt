@@ -1,6 +1,7 @@
 //! Vault writes (PRD 7.2): body edits and frontmatter updates, atomic and change-checked.
 
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 use crate::error::{Result, VltError};
@@ -123,6 +124,17 @@ pub(crate) fn atomic_replace(path: &Path, original: &[u8], new: &[u8]) -> Result
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+/// Writes `new` to a file that must not exist yet: the exclusive create never replaces a file and never
+/// follows a symlink at `path`. A failed write removes the partial file.
+pub(crate) fn create_new(path: &Path, new: &[u8]) -> std::io::Result<()> {
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    let written = file.write_all(new).and_then(|()| file.sync_all());
+    if written.is_err() {
+        let _ = fs::remove_file(path);
+    }
+    written
 }
 
 /// Replaces the single occurrence of `old` in the body (after the frontmatter) of LF text.

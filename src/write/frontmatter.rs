@@ -178,7 +178,7 @@ fn entry_continues(rest: &[&str]) -> bool {
 }
 
 /// The top-level key a line starts, and the text after its colon.
-fn key_of(line: &str) -> Option<(String, &str)> {
+pub(crate) fn key_of(line: &str) -> Option<(String, &str)> {
     let first = line.chars().next()?;
     if first.is_whitespace() || first == '#' || first == '-' {
         return None;

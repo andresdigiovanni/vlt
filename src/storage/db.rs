@@ -8,7 +8,7 @@ use crate::error::{Result, VltError};
 use crate::indexer::parser::{Heading, RawLink};
 use crate::ml::profile::LEGACY_FINGERPRINT;
 
-pub const SCHEMA_VERSION: &str = "2";
+pub const SCHEMA_VERSION: &str = "4";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexMeta {
@@ -33,6 +33,7 @@ pub struct FileRow {
     pub sha256: String,
     pub title: String,
     pub properties: Option<serde_json::Map<String, serde_json::Value>>,
+    pub tags: Vec<String>,
     pub frontmatter_error: Option<String>,
 }
 
@@ -68,6 +69,7 @@ CREATE TABLE IF NOT EXISTS files (
     indexed_at INTEGER NOT NULL,
     title TEXT NOT NULL,
     properties_json TEXT NULL,
+    tags_json TEXT NOT NULL,
     frontmatter_error TEXT NULL
 );
 CREATE TABLE IF NOT EXISTS excluded_files (path TEXT PRIMARY KEY);
@@ -97,7 +99,8 @@ CREATE TABLE IF NOT EXISTS links (
     heading TEXT NULL,
     raw TEXT NOT NULL,
     line INTEGER NOT NULL,
-    kind TEXT NOT NULL CHECK (kind IN ('wiki', 'embed', 'markdown'))
+    kind TEXT NOT NULL CHECK (kind IN ('wiki', 'embed', 'markdown')),
+    property TEXT NULL
 );
 CREATE INDEX IF NOT EXISTS links_src_path ON links(src_path);
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(text, tokenize='porter unicode61');
@@ -285,9 +288,10 @@ pub fn put_file(
     delete_file(conn, &file.path)?;
     let indexed_at = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     let properties_json = file.properties.as_ref().map(to_json).transpose()?;
+    let tags_json = to_json(&file.tags)?;
     conn.execute(
-        "INSERT INTO files (path, mtime_ns, size, sha256, indexed_at, title, properties_json, frontmatter_error)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO files (path, mtime_ns, size, sha256, indexed_at, title, properties_json, tags_json, frontmatter_error)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             file.path,
             file.mtime_ns,
@@ -296,6 +300,7 @@ pub fn put_file(
             indexed_at,
             file.title,
             properties_json,
+            tags_json,
             file.frontmatter_error
         ],
     )?;
@@ -326,10 +331,10 @@ pub fn put_file(
         insert_heading.execute(params![file.path, h.level, h.text, to_json(&h.heading_path)?, h.line as i64])?;
     }
     let mut insert_link = conn.prepare(
-        "INSERT INTO links (src_path, target, heading, raw, line, kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO links (src_path, target, heading, raw, line, kind, property) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )?;
     for l in links {
-        insert_link.execute(params![file.path, l.target, l.heading, l.raw, l.line as i64, l.kind.as_str()])?;
+        insert_link.execute(params![file.path, l.target, l.heading, l.raw, l.line as i64, l.kind.as_str(), l.property])?;
     }
     Ok(())
 }
@@ -377,7 +382,8 @@ mod tests {
     fn meta() -> IndexMeta { IndexMeta { model_id: "fake".into(), dim: 2, fingerprint: "fake".into(), vault: "/v".into() } }
     fn file(path: &str) -> FileRow {
         FileRow { path: path.into(), mtime_ns: 1, size: 2, sha256: "h".into(), title: "T".into(),
-                  properties: Some(serde_json::json!({"tags": ["a"]}).as_object().unwrap().clone()), frontmatter_error: None }
+                  properties: Some(serde_json::json!({"tags": ["a"]}).as_object().unwrap().clone()),
+                  tags: vec!["a".into()], frontmatter_error: None }
     }
     fn chunk(id: &str, text: &str, v: [f32; 2]) -> ChunkRow {
         ChunkRow { chunk_id: id.into(), section_id: id.into(), heading_path: vec!["H".into()], start_line: 1, end_line: 2,
@@ -419,6 +425,10 @@ mod tests {
         assert!(msg(&m).starts_with("fingerprint"), "{}", msg(&m));
         Db::open_unchecked(&p).unwrap().conn().execute("UPDATE meta SET value = '0' WHERE key = 'schema_version'", []).unwrap();
         assert!(msg(&meta()).starts_with("schema_version"), "{}", msg(&meta()));
+        Db::open_unchecked(&p).unwrap().conn().execute("UPDATE meta SET value = '2' WHERE key = 'schema_version'", []).unwrap();
+        assert!(msg(&meta()).starts_with("schema_version"), "an index built before body tags asks for a rebuild");
+        Db::open_unchecked(&p).unwrap().conn().execute("UPDATE meta SET value = '3' WHERE key = 'schema_version'", []).unwrap();
+        assert!(msg(&meta()).starts_with("schema_version"), "an index built before property links asks for a rebuild");
     }
 
     #[test]
@@ -439,7 +449,7 @@ mod tests {
         let db = Db::open(&d.path().join("vlt.db"), &meta()).unwrap();
         let c = db.conn();
         let h = vec![Heading { level: 1, text: "H".into(), heading_path: vec!["H".into()], line: 1 }];
-        let l = vec![RawLink { kind: LinkKind::Wiki, target: "b".into(), heading: None, raw: "[[b]]".into(), line: 2 }];
+        let l = vec![RawLink { kind: LinkKind::Wiki, target: "b".into(), heading: None, raw: "[[b]]".into(), line: 2, property: None }];
         put_file(c, &file("a.md"), &[chunk("a.md#H", "sqlite wal mode", [1.0, 0.0]), chunk("a.md#I", "other", [0.0, 1.0])], &h, &l).unwrap();
         assert_eq!((count(c, "chunks"), count(c, "chunk_vectors"), count(c, "headings"), count(c, "links")), (2, 2, 1, 1));
         let hit: String = c.query_row(
@@ -468,7 +478,7 @@ mod tests {
         let mut ch = chunk("a.md#H", "body", [1.0, 0.0]);
         ch.fts_text = "T > H body".into();
         let h = vec![Heading { level: 2, text: "H".into(), heading_path: vec!["T".into(), "H".into()], line: 3 }];
-        let l = vec![RawLink { kind: LinkKind::Embed, target: "img.png".into(), heading: Some("x".into()), raw: "![[img.png#x]]".into(), line: 4 }];
+        let l = vec![RawLink { kind: LinkKind::Embed, target: "img.png".into(), heading: Some("x".into()), raw: "![[img.png#x]]".into(), line: 4, property: None }];
         put_file(c, &f, &[ch], &h, &l).unwrap();
 
         let row: (String, Option<String>, Option<String>) = c.query_row(
