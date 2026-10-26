@@ -300,3 +300,20 @@ fn opencode_config_with_comments_is_left_alone_and_the_install_goes_on() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("by hand"));
     assert_eq!(fs::read_to_string(dir.join("opencode.jsonc")).unwrap(), original);
 }
+
+#[test]
+fn install_announces_the_index_and_the_model_load_before_the_progress_line() {
+    let d = tempfile::tempdir().unwrap();
+    let home = d.path();
+    let vault = home.join("v");
+    fs::create_dir_all(&vault).unwrap();
+    fs::write(vault.join("a.md"), "# A\n\nAlpha.\n").unwrap();
+    let out = install(home, &["--vault", vault.to_str().unwrap(), "--yes", "--target", "claude"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let err = String::from_utf8_lossy(&out.stderr);
+    let start = err.find("Indexing 1 note (1 KB) on the CPU").expect(&err);
+    let load = err.find("Loading the embedding model…\n").expect(&err);
+    let line = err.find("\r\x1b[KIndexing 1/1 note · 1/1 KB (100%)").expect(&err);
+    assert!(start < load && load < line, "{err:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("✓ Vault indexed: added 1"));
+}

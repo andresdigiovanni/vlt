@@ -354,7 +354,7 @@ mod tests {
         fs::write(v.join("notes.md"), "---\ntags: [cooking]\n---\n# Pasta\n\nBoil water with salt.\n").unwrap();
         let mut db = Db::open(&d.path().join("vlt.db"), &IndexMeta { model_id: "fake".into(), dim: 384, fingerprint: "fake".into(), vault: "v".into() }).unwrap();
         let src = || -> crate::Result<Arc<dyn crate::ml::Embedder>> { Ok(Arc::new(FakeEmbedder)) };
-        reindex(db.conn_mut(), &v, &build_exclude(&[]).unwrap(), &src, &mut |_, _| {}).unwrap();
+        reindex(db.conn_mut(), &v, &build_exclude(&[]).unwrap(), &src, &mut |_| {}).unwrap();
         (d, db)
     }
     fn run(db: &Db, req: SearchRequest) -> crate::Result<SearchResponse> {
@@ -376,7 +376,7 @@ mod tests {
         }
         let mut db = Db::open(&d.path().join("vlt.db"), &IndexMeta { model_id: "fake".into(), dim: 384, fingerprint: "fake".into(), vault: "v".into() }).unwrap();
         let src = || -> crate::Result<Arc<dyn crate::ml::Embedder>> { Ok(Arc::new(FakeEmbedder)) };
-        reindex(db.conn_mut(), &v, &build_exclude(&[]).unwrap(), &src, &mut |_, _| {}).unwrap();
+        reindex(db.conn_mut(), &v, &build_exclude(&[]).unwrap(), &src, &mut |_| {}).unwrap();
         let paths = |w: Value| load_filtered_paths(db.conn(), &Filter::new(Some(&w), None).unwrap()).unwrap();
         assert_eq!(paths(json!({"tags": "rust"})), vec!["body.md", "fm.md"], "nested body tag and a split frontmatter string");
         assert_eq!(paths(json!({"tags": "mcp"})), vec!["fm.md"]);
@@ -640,7 +640,7 @@ mod tests {
         }
         let mut db = Db::open(&d.path().join("vlt.db"), &IndexMeta { model_id: "fake".into(), dim: 384, fingerprint: "fake".into(), vault: "v".into() }).unwrap();
         let src = || -> crate::Result<Arc<dyn crate::ml::Embedder>> { Ok(Arc::new(FakeEmbedder)) };
-        reindex(db.conn_mut(), &v, &build_exclude(&[]).unwrap(), &src, &mut |_, _| {}).unwrap();
+        reindex(db.conn_mut(), &v, &build_exclude(&[]).unwrap(), &src, &mut |_| {}).unwrap();
         (d, db)
     }
 
@@ -694,7 +694,7 @@ mod tests {
         fs::write(v.join("big.md"), text).unwrap();
         let mut db = Db::open(&d.path().join("vlt.db"), &IndexMeta { model_id: "fake".into(), dim: 384, fingerprint: "fake".into(), vault: "v".into() }).unwrap();
         let src = || -> crate::Result<Arc<dyn crate::ml::Embedder>> { Ok(Arc::new(FakeEmbedder)) };
-        reindex(db.conn_mut(), &v, &build_exclude(&[]).unwrap(), &src, &mut |_, _| {}).unwrap();
+        reindex(db.conn_mut(), &v, &build_exclude(&[]).unwrap(), &src, &mut |_| {}).unwrap();
         assert_eq!(chunk_count(&db), 5, "every paragraph is its own chunk");
         (d, db)
     }

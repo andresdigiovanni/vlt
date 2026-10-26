@@ -377,8 +377,8 @@ pub fn pull(
 fn progress_text(id: &str, name: &str, done: u64, total: Option<u64>) -> String {
     let mb = |b: u64| b as f64 / 1_048_576.0;
     match total {
-        Some(t) => format!("\r{id} {name}: {:.1}/{:.1} MB", mb(done), mb(t)),
-        None => format!("\r{id} {name}: {:.1} MB", mb(done)),
+        Some(t) => format!("\r\x1b[K{id} {name}: {:.1}/{:.1} MB", mb(done), mb(t)),
+        None => format!("\r\x1b[K{id} {name}: {:.1} MB", mb(done)),
     }
 }
 
@@ -694,8 +694,8 @@ mod tests {
     }
 
     #[test]
-    fn progress_text_shows_megabytes_with_and_without_a_total() {
-        assert_eq!(progress_text("o/m", "a.bin", 1_572_864, Some(3_145_728)), "\ro/m a.bin: 1.5/3.0 MB");
-        assert_eq!(progress_text("o/m", "a.bin", 524_288, None), "\ro/m a.bin: 0.5 MB");
+    fn progress_text_clears_the_line_and_shows_megabytes_with_and_without_a_total() {
+        assert_eq!(progress_text("o/m", "a.bin", 1_572_864, Some(3_145_728)), "\r\x1b[Ko/m a.bin: 1.5/3.0 MB");
+        assert_eq!(progress_text("o/m", "a.bin", 524_288, None), "\r\x1b[Ko/m a.bin: 0.5 MB");
     }
 }

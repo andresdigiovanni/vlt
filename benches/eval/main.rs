@@ -220,7 +220,7 @@ fn main() {
         }
     }
     let t = Instant::now();
-    app.reindex(true, &mut |_, _| {}).unwrap_or_else(|e| fail(format!("reindex: {e}")));
+    app.reindex(true, &mut |_| {}).unwrap_or_else(|e| fail(format!("reindex: {e}")));
     let indexing = t.elapsed();
 
     let meta = app.models.index_meta(&app.cfg.vault).unwrap_or_else(|e| fail(format!("{e}")));

@@ -60,7 +60,7 @@ impl App {
     }
 
     /// Incremental reindex, or a full rebuild when `force` or the index does not match the configuration.
-    pub fn reindex(&self, force: bool, progress: &mut dyn FnMut(usize, usize)) -> Result<ReindexOutcome> {
+    pub fn reindex(&self, force: bool, progress: &mut dyn FnMut(indexer::Progress)) -> Result<ReindexOutcome> {
         let Some(_lock) = self.lock()? else {
             return Ok(ReindexOutcome { stats: ReindexStats::default(), reindexed: false });
         };
@@ -83,7 +83,7 @@ impl App {
         };
         let mut db = Db::open(&self.db_path(), &self.models.index_meta(&self.cfg.vault)?)?;
         let source = || self.models.embedder();
-        let stats = indexer::reindex(db.conn_mut(), &self.cfg.vault, &self.exclude, &source, &mut |_, _| {})?;
+        let stats = indexer::reindex(db.conn_mut(), &self.cfg.vault, &self.exclude, &source, &mut |_| {})?;
         Ok(ReindexOutcome { stats, reindexed: true })
     }
 
@@ -95,7 +95,7 @@ impl App {
             Some(_lock) => {
                 let mut db = Db::open(&path, &meta)?;
                 let source = || self.models.embedder();
-                indexer::reindex(db.conn_mut(), &self.cfg.vault, &self.exclude, &source, &mut |_, _| {})?;
+                indexer::reindex(db.conn_mut(), &self.cfg.vault, &self.exclude, &source, &mut |_| {})?;
                 Ok(db)
             }
             None if Db::exists(&path) && has_meta(&path)? => Db::open(&path, &meta),

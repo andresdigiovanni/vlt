@@ -3,13 +3,12 @@ pub mod models;
 pub mod prompts;
 pub mod skill;
 
-use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 use clap::ValueEnum;
 
 use crate::app::App;
-use crate::cli::{is_stdout_closed, write_out};
+use crate::cli::{is_stdout_closed, write_out, IndexProgress};
 use crate::config::Config;
 use crate::ml::models::Models;
 use crate::paths;
@@ -177,17 +176,9 @@ fn write_config(config_path: &Path, existing: Option<(&str, &Config)>, vault: &P
 
 fn index() -> Result<()> {
     let app = App::load()?;
-    let mut shown = false;
-    let out = app.reindex(false, &mut |done, total| {
-        if total > 0 {
-            eprint!("\rIndexing {done}/{total}");
-            let _ = std::io::stderr().flush();
-            shown = true;
-        }
-    })?;
-    if shown {
-        eprintln!();
-    }
+    let mut progress = IndexProgress::new();
+    let out = app.reindex(false, &mut |p| progress.show(p))?;
+    progress.finish();
     if out.reindexed {
         let s = &out.stats;
         say(format_args!("✓ Vault indexed: added {}, updated {}, removed {}, unchanged {}\n", s.added, s.updated, s.removed, s.unchanged))?;

@@ -52,10 +52,10 @@ fn main() {
     }
 
     let t = Instant::now();
-    app.reindex(false, &mut |_, _| {}).unwrap();
+    app.reindex(false, &mut |_| {}).unwrap();
     let initial = t.elapsed();
     let t = Instant::now();
-    app.reindex(false, &mut |_, _| {}).unwrap();
+    app.reindex(false, &mut |_| {}).unwrap();
     let noop = t.elapsed();
 
     let queries = ["sqlite lock journal", "vector index latency", "rust thread memory", "graph token model", "backup disk file"];

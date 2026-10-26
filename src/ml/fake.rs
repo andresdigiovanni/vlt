@@ -68,6 +68,15 @@ impl Reranker for FakeReranker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedding_with_progress_by_default_reports_every_text_once_after_embedding() {
+        let texts = ["alpha beta", "gamma", "delta epsilon zeta"];
+        let mut batches = Vec::new();
+        let v = FakeEmbedder.embed_with_progress(&texts, &mut |b| batches.push(b.to_vec())).unwrap();
+        assert_eq!(v, FakeEmbedder.embed(&texts).unwrap());
+        assert_eq!(batches, vec![vec![0, 1, 2]]);
+    }
     use crate::ml::{Embedder, Reranker};
     fn dot(a: &[f32], b: &[f32]) -> f32 { a.iter().zip(b).map(|(x, y)| x * y).sum() }
 

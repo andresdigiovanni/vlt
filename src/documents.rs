@@ -412,7 +412,7 @@ mod tests {
         for (p, c) in files { let p = v.join(p); fs::create_dir_all(p.parent().unwrap()).unwrap(); fs::write(p, c).unwrap(); }
         let mut db = Db::open(&d.path().join("vlt.db"), &IndexMeta { model_id: "fake".into(), dim: 384, fingerprint: "fake".into(), vault: "v".into() }).unwrap();
         let src = || -> crate::Result<Arc<dyn crate::ml::Embedder>> { Ok(Arc::new(FakeEmbedder)) };
-        reindex(db.conn_mut(), &v, &build_exclude(&["ex/**".into()]).unwrap(), &src, &mut |_, _| {}).unwrap();
+        reindex(db.conn_mut(), &v, &build_exclude(&["ex/**".into()]).unwrap(), &src, &mut |_| {}).unwrap();
         (d, v, db)
     }
 
@@ -439,7 +439,7 @@ mod tests {
         }
         let mut db = Db::open(&d.path().join("vlt.db"), &IndexMeta { model_id: "fake".into(), dim: 384, fingerprint: "fake".into(), vault: "v".into() }).unwrap();
         let src = || -> crate::Result<Arc<dyn crate::ml::Embedder>> { Ok(Arc::new(FakeEmbedder)) };
-        reindex(db.conn_mut(), &v, &build_exclude(&[]).unwrap(), &src, &mut |_, _| {}).unwrap();
+        reindex(db.conn_mut(), &v, &build_exclude(&[]).unwrap(), &src, &mut |_| {}).unwrap();
         let links = serde_json::to_value(get_document(db.conn(), &v, "src.md").unwrap()).unwrap()["links"].clone();
         assert_eq!(links[0], json!({"raw": "[[x]]", "line": 1, "resolved": null, "status": "ambiguous", "candidates": ["a/x.md", "b/x.md"]}));
         assert_eq!(links[1], json!({"raw": "[[a/x]]", "line": 1, "resolved": "a/x.md", "status": "ok"}));
@@ -454,7 +454,7 @@ mod tests {
         fs::write(v.join("long.md"), format!("# Long\n{para}\n\n{para}\n\n{para}\n## Next\nshort\n")).unwrap();
         let mut db = Db::open(&d.path().join("vlt.db"), &IndexMeta { model_id: "fake".into(), dim: 384, fingerprint: "fake".into(), vault: "v".into() }).unwrap();
         let src = || -> crate::Result<Arc<dyn crate::ml::Embedder>> { Ok(Arc::new(FakeEmbedder)) };
-        reindex(db.conn_mut(), &v, &build_exclude(&[]).unwrap(), &src, &mut |_, _| {}).unwrap();
+        reindex(db.conn_mut(), &v, &build_exclude(&[]).unwrap(), &src, &mut |_| {}).unwrap();
         let doc = get_document(db.conn(), &v, "long.md").unwrap();
         let secs: Vec<_> = doc.sections.iter().map(|s| (s.chunk_id.as_str(), s.lines)).collect();
         assert_eq!(secs, vec![("long.md#Long", [1, 6]), ("long.md#Next", [7, 8])]);
@@ -502,7 +502,7 @@ mod tests {
         for (p, c) in files { let p = v.join(p); fs::create_dir_all(p.parent().unwrap()).unwrap(); fs::write(p, c).unwrap(); }
         let mut db = Db::open(&d.path().join("vlt.db"), &IndexMeta { model_id: "fake".into(), dim: 384, fingerprint: "fake".into(), vault: "v".into() }).unwrap();
         let src = || -> crate::Result<Arc<dyn crate::ml::Embedder>> { Ok(Arc::new(FakeEmbedder)) };
-        reindex(db.conn_mut(), &v, &build_exclude(&[]).unwrap(), &src, &mut |_, _| {}).unwrap();
+        reindex(db.conn_mut(), &v, &build_exclude(&[]).unwrap(), &src, &mut |_| {}).unwrap();
         (d, db)
     }
 
@@ -695,7 +695,7 @@ mod tests {
         for (p, c) in files { let p = v.join(p); fs::create_dir_all(p.parent().unwrap()).unwrap(); fs::write(p, c).unwrap(); }
         let mut db = Db::open(&d.path().join("vlt.db"), &IndexMeta { model_id: "fake".into(), dim: 384, fingerprint: "fake".into(), vault: "v".into() }).unwrap();
         let src = || -> crate::Result<Arc<dyn crate::ml::Embedder>> { Ok(Arc::new(FakeEmbedder)) };
-        reindex(db.conn_mut(), &v, &build_exclude(&["ex/**".into()]).unwrap(), &src, &mut |_, _| {}).unwrap();
+        reindex(db.conn_mut(), &v, &build_exclude(&["ex/**".into()]).unwrap(), &src, &mut |_| {}).unwrap();
 
         let r = list_folders(db.conn(), None).unwrap();
         let rows: Vec<_> = r.folders.iter().map(|f| (f.path.as_str(), f.documents, f.total)).collect();

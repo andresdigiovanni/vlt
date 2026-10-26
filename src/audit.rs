@@ -339,7 +339,7 @@ mod tests {
         for (p, c) in files { let p = v.join(p); fs::create_dir_all(p.parent().unwrap()).unwrap(); fs::write(p, c).unwrap(); }
         let mut db = Db::open(&d.path().join("vlt.db"), &IndexMeta { model_id: "fake".into(), dim: 384, fingerprint: "fake".into(), vault: "v".into() }).unwrap();
         let src = || -> crate::Result<Arc<dyn crate::ml::Embedder>> { Ok(Arc::new(FakeEmbedder)) };
-        reindex(db.conn_mut(), &v, &build_exclude(&[]).unwrap(), &src, &mut |_, _| {}).unwrap();
+        reindex(db.conn_mut(), &v, &build_exclude(&[]).unwrap(), &src, &mut |_| {}).unwrap();
         (d, db)
     }
 
@@ -497,7 +497,7 @@ mod tests {
         }
         let mut db = Db::open(&d.path().join("vlt.db"), &IndexMeta { model_id: "fake".into(), dim: 384, fingerprint: "fake".into(), vault: "v".into() }).unwrap();
         let src = || -> crate::Result<Arc<dyn crate::ml::Embedder>> { Ok(Arc::new(FakeEmbedder)) };
-        reindex(db.conn_mut(), &v, &build_exclude(&["ex/**".into()]).unwrap(), &src, &mut |_, _| {}).unwrap();
+        reindex(db.conn_mut(), &v, &build_exclude(&["ex/**".into()]).unwrap(), &src, &mut |_| {}).unwrap();
         let r = audit(db.conn(), None).unwrap();
         assert!(r.no_outgoing.items.is_empty(), "a.md links to an excluded note, which `get` reports ok");
         assert!(r.broken_links.items.is_empty());

@@ -57,6 +57,22 @@ fn padding_does_not_change_embeddings() {
     assert!(alone[0].iter().zip(&padded[0]).all(|(a, b)| (a - b).abs() < 1e-4));
 }
 
+fn progress_reports_each_forward_pass_once_with_the_same_vectors() {
+    let e = embedder();
+    let long = "SQLite in WAL mode lets many readers run concurrently with one writer. ".repeat(30);
+    let mut texts: Vec<String> = (0..6).map(|i| format!("{i} {long}")).collect();
+    texts.extend((0..10).map(|i| format!("short text {i}")));
+    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let mut batches: Vec<Vec<usize>> = Vec::new();
+    let v = e.embed_with_progress(&refs, &mut |b| batches.push(b.to_vec())).unwrap();
+    assert!(batches.len() > 1, "{batches:?}");
+    let mut reported = batches.concat();
+    reported.sort();
+    assert_eq!(reported, (0..refs.len()).collect::<Vec<_>>());
+    let plain = e.embed(&refs).unwrap();
+    assert!(v.iter().zip(&plain).all(|(a, b)| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-5)));
+}
+
 fn queries_rank_their_answer_above_unrelated_text() {
     let e = embedder();
     let q = e.embed_query("how do readers and writers share a sqlite database").unwrap();
@@ -96,6 +112,7 @@ fn main() {
     let checks: &[(&str, fn())] = &[
         ("real_embedder_ranks_related_text_higher", real_embedder_ranks_related_text_higher),
         ("padding_does_not_change_embeddings", padding_does_not_change_embeddings),
+        ("progress_reports_each_forward_pass_once_with_the_same_vectors", progress_reports_each_forward_pass_once_with_the_same_vectors),
         ("queries_rank_their_answer_above_unrelated_text", queries_rank_their_answer_above_unrelated_text),
         ("real_cross_encoder_scores_relevant_pair_higher", real_cross_encoder_scores_relevant_pair_higher),
         ("long_document_is_truncated_not_the_query", long_document_is_truncated_not_the_query),

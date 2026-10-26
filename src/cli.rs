@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use serde_json::Value;
@@ -6,6 +7,7 @@ use serde_json::Value;
 use crate::app::App;
 use crate::audit::{AuditResponse, Section};
 use crate::documents::{DocumentResponse, FoldersResponse, PropertiesResponse};
+use crate::indexer::Progress;
 use crate::installer::models::{missing, pull_showing_progress};
 use crate::installer::{InstallOptions, Target};
 use crate::ml::models::Models;
@@ -237,17 +239,9 @@ fn dispatch(cmd: Command) -> Result<()> {
         Command::Reindex { force } => {
             let app = App::load()?;
             pull_missing_models(&app)?;
-            let mut shown = false;
-            let out = app.reindex(force, &mut |done, total| {
-                if total > 0 {
-                    eprint!("\rIndexing {done}/{total}");
-                    let _ = std::io::stderr().flush();
-                    shown = true;
-                }
-            })?;
-            if shown {
-                eprintln!();
-            }
+            let mut progress = IndexProgress::new();
+            let out = app.reindex(force, &mut |p| progress.show(p))?;
+            progress.finish();
             if out.reindexed {
                 let s = &out.stats;
                 write_out(format_args!("added {}, updated {}, removed {}, unchanged {}\n", s.added, s.updated, s.removed, s.unchanged))?;
@@ -414,6 +408,93 @@ fn render_related(resp: &RelatedResponse) -> String {
     out
 }
 
+fn notes(n: usize) -> &'static str {
+    if n == 1 {
+        "note"
+    } else {
+        "notes"
+    }
+}
+
+fn size_text(bytes: u64) -> String {
+    let kb = bytes as f64 / 1024.0;
+    if kb < 1024.0 {
+        format!("{:.0} KB", kb.max(1.0))
+    } else {
+        format!("{:.1} MB", kb / 1024.0)
+    }
+}
+
+/// `done` of `total`, both in the unit `size_text` picks for `total`.
+fn sizes_text(done: u64, total: u64) -> String {
+    let kb = |b: u64| if b == 0 { 0.0 } else { (b as f64 / 1024.0).max(1.0) };
+    if kb(total) < 1024.0 {
+        format!("{:.0}/{:.0} KB", kb(done), kb(total))
+    } else {
+        format!("{:.1}/{:.1} MB", done as f64 / 1_048_576.0, total as f64 / 1_048_576.0)
+    }
+}
+
+fn time_left(secs: u64) -> String {
+    if secs < 60 {
+        format!("~{secs} s left")
+    } else {
+        format!("~{} min left", secs.div_ceil(60))
+    }
+}
+
+/// The stderr text of a reindex `Progress`; `elapsed` is the time since `Progress::Started`.
+fn progress_text(p: Progress, elapsed: Duration) -> String {
+    match p {
+        Progress::Started { files, bytes } => format!(
+            "Indexing {files} {} ({}) on the CPU; a large vault can take several minutes\n",
+            notes(files),
+            size_text(bytes)
+        ),
+        Progress::LoadingModel => "Loading the embedding model…\n".into(),
+        Progress::Indexed { files_done, files_total, bytes_done, bytes_total } => {
+            let pct = (bytes_done * 100).checked_div(bytes_total).unwrap_or(100);
+            let mut line = format!(
+                "\r\x1b[KIndexing {files_done}/{files_total} {} · {} ({pct}%)",
+                notes(files_total),
+                sizes_text(bytes_done, bytes_total)
+            );
+            if bytes_done > 0 && bytes_done < bytes_total {
+                let left = elapsed.as_secs_f64() * (bytes_total - bytes_done) as f64 / bytes_done as f64;
+                line.push_str(&format!(" · {}", time_left(left.round() as u64)));
+            }
+            line
+        }
+    }
+}
+
+/// Shows reindex progress on stderr; `finish` ends the line rewritten in place.
+pub(crate) struct IndexProgress {
+    started: Instant,
+    line_open: bool,
+}
+
+impl IndexProgress {
+    pub(crate) fn new() -> Self {
+        IndexProgress { started: Instant::now(), line_open: false }
+    }
+
+    pub(crate) fn show(&mut self, p: Progress) {
+        if let Progress::Started { .. } = p {
+            self.started = Instant::now();
+        }
+        self.line_open = matches!(p, Progress::Indexed { .. });
+        eprint!("{}", progress_text(p, self.started.elapsed()));
+        let _ = std::io::stderr().flush();
+    }
+
+    pub(crate) fn finish(&self) {
+        if self.line_open {
+            eprintln!();
+        }
+    }
+}
+
 /// Downloads the configured models that are not on disk yet; progress goes to stderr.
 fn pull_missing_models(app: &App) -> Result<()> {
     if Models::fake_from_env() {
@@ -426,4 +507,38 @@ fn pull_missing_models(app: &App) -> Result<()> {
         }
     }
     app.models.check()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn indexed(files_done: usize, bytes_done: u64) -> Progress {
+        Progress::Indexed { files_done, files_total: 58, bytes_done, bytes_total: 4_000_000 }
+    }
+
+    #[test]
+    fn the_start_and_the_model_load_each_get_their_own_line() {
+        let t = progress_text(Progress::Started { files: 58, bytes: 953_000 }, Duration::ZERO);
+        assert_eq!(t, "Indexing 58 notes (931 KB) on the CPU; a large vault can take several minutes\n");
+        let t = progress_text(Progress::Started { files: 1, bytes: 3_000_000 }, Duration::ZERO);
+        assert_eq!(t, "Indexing 1 note (2.9 MB) on the CPU; a large vault can take several minutes\n");
+        assert_eq!(progress_text(Progress::LoadingModel, Duration::ZERO), "Loading the embedding model…\n");
+    }
+
+    #[test]
+    fn the_indexed_line_clears_itself_and_shows_the_bytes_embedded_their_share_and_the_time_left() {
+        assert_eq!(progress_text(indexed(0, 0), Duration::from_secs(5)), "\r\x1b[KIndexing 0/58 notes · 0.0/3.8 MB (0%)");
+        assert_eq!(progress_text(indexed(12, 1_000_000), Duration::from_secs(60)), "\r\x1b[KIndexing 12/58 notes · 1.0/3.8 MB (25%) · ~3 min left");
+        assert_eq!(progress_text(indexed(50, 3_600_000), Duration::from_secs(270)), "\r\x1b[KIndexing 50/58 notes · 3.4/3.8 MB (90%) · ~30 s left");
+        assert_eq!(progress_text(indexed(58, 4_000_000), Duration::from_secs(300)), "\r\x1b[KIndexing 58/58 notes · 3.8/3.8 MB (100%)");
+    }
+
+    #[test]
+    fn under_a_megabyte_both_byte_counts_are_in_kilobytes() {
+        let kb = |files_done, bytes_done, bytes_total| progress_text(Progress::Indexed { files_done, files_total: 58, bytes_done, bytes_total }, Duration::from_secs(60));
+        assert_eq!(kb(0, 0, 954_368), "\r\x1b[KIndexing 0/58 notes · 0/932 KB (0%)");
+        assert_eq!(kb(0, 429_056, 954_368), "\r\x1b[KIndexing 0/58 notes · 419/932 KB (44%) · ~2 min left");
+        assert_eq!(kb(1, 12, 12), "\r\x1b[KIndexing 1/58 notes · 1/1 KB (100%)", "a few bytes still show as 1 KB, as the total does");
+    }
 }

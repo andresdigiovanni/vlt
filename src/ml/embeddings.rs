@@ -228,28 +228,34 @@ impl TextEmbedder {
             .map_err(model_err)
     }
 
-    fn embed_raw(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+    fn embed_raw(&self, texts: &[&str], on_batch: &mut dyn FnMut(&[usize])) -> Result<Vec<Vec<f32>>> {
         let encodings = self.tokenizer.encode_batch(texts.to_vec(), true).map_err(model_err)?;
         let lens: Vec<usize> = encodings.iter().map(|e| e.len()).collect();
         let mut encodings: Vec<Option<tokenizers::Encoding>> = encodings.into_iter().map(Some).collect();
         in_length_batches(&lens, BATCH, BATCH_TOKENS, |batch| {
-            self.embed_batch(batch.iter().filter_map(|&i| encodings[i].take()).collect())
+            let vectors = self.embed_batch(batch.iter().filter_map(|&i| encodings[i].take()).collect())?;
+            on_batch(batch);
+            Ok(vectors)
         })
     }
 }
 
 impl Embedder for TextEmbedder {
     fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        self.embed_with_progress(texts, &mut |_| {})
+    }
+
+    fn embed_with_progress(&self, texts: &[&str], on_batch: &mut dyn FnMut(&[usize])) -> Result<Vec<Vec<f32>>> {
         if self.document_prefix.is_empty() {
-            return self.embed_raw(texts);
+            return self.embed_raw(texts, on_batch);
         }
         let prefixed: Vec<String> = texts.iter().map(|t| format!("{}{t}", self.document_prefix)).collect();
-        self.embed_raw(&prefixed.iter().map(String::as_str).collect::<Vec<_>>())
+        self.embed_raw(&prefixed.iter().map(String::as_str).collect::<Vec<_>>(), on_batch)
     }
 
     fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
         let text = format!("{}{query}", self.query_prefix);
-        self.embed_raw(&[&text])?
+        self.embed_raw(&[&text], &mut |_| {})?
             .pop()
             .ok_or_else(|| VltError::Internal("the embedder returned no vector".into()))
     }

@@ -422,7 +422,9 @@ fn reindex_progress_goes_to_stderr_and_summary_to_stdout() {
     assert!(out.status.success());
     assert_eq!(String::from_utf8_lossy(&out.stdout), "added 2, updated 0, removed 0, unchanged 0\n");
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("\rIndexing 2/2"), "{err:?}");
+    assert!(err.starts_with("Indexing 2 notes ("), "{err:?}");
+    assert!(err.contains("Loading the embedding model…\n"), "{err:?}");
+    assert!(err.contains("\r\x1b[KIndexing 2/2 notes · ") && err.contains(" KB (100%)"), "{err:?}");
     assert!(err.ends_with('\n'));
     assert!(!String::from_utf8_lossy(&out.stdout).contains("Indexing"));
 }

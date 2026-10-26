@@ -26,6 +26,17 @@ pub struct ReindexStats {
 
 pub type EmbedderSource<'a> = &'a dyn Fn() -> Result<Arc<dyn Embedder>>;
 
+/// What a reindex reports while it runs; nothing when no file needs embedding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Progress {
+    /// `files` files, `bytes` bytes on disk, are about to be embedded.
+    Started { files: usize, bytes: u64 },
+    /// The embedding model is loading: once per run, before the first embedding.
+    LoadingModel,
+    /// `bytes_done` estimates the embedded share of `bytes_total`; `files_done` files are written.
+    Indexed { files_done: usize, files_total: usize, bytes_done: u64, bytes_total: u64 },
+}
+
 /// Calls the source at most once, and only when an embedder is first needed.
 struct LazyEmbedder<'a> {
     source: EmbedderSource<'a>,
@@ -37,10 +48,11 @@ impl<'a> LazyEmbedder<'a> {
         LazyEmbedder { source, loaded: None }
     }
 
-    fn get(&mut self) -> Result<Arc<dyn Embedder>> {
+    fn get(&mut self, progress: &mut dyn FnMut(Progress)) -> Result<Arc<dyn Embedder>> {
         if let Some(e) = &self.loaded {
             return Ok(e.clone());
         }
+        progress(Progress::LoadingModel);
         let e = (self.source)()?;
         self.loaded = Some(e.clone());
         Ok(e)
@@ -58,17 +70,51 @@ fn file_stem(rel_path: &str) -> &str {
     Path::new(name).file_stem().and_then(|s| s.to_str()).unwrap_or(name)
 }
 
-/// Parses, chunks and embeds several files with one embedder call; touches no database.
+/// Counts the files and bytes of a run for `Progress`.
+struct Tracker<'p> {
+    progress: &'p mut dyn FnMut(Progress),
+    files_done: usize,
+    files_total: usize,
+    bytes_done: u64,
+    bytes_total: u64,
+}
+
+impl<'p> Tracker<'p> {
+    /// Reports `Started` when there is something to embed.
+    fn start(progress: &'p mut dyn FnMut(Progress), files: &[&ScannedFile]) -> Self {
+        let bytes_total = files.iter().map(|f| f.size).sum();
+        if !files.is_empty() {
+            progress(Progress::Started { files: files.len(), bytes: bytes_total });
+        }
+        Tracker { progress, files_done: 0, files_total: files.len(), bytes_done: 0, bytes_total }
+    }
+
+    fn report(&mut self) {
+        let (files_done, files_total, bytes_done, bytes_total) = (self.files_done, self.files_total, self.bytes_done, self.bytes_total);
+        (self.progress)(Progress::Indexed { files_done, files_total, bytes_done, bytes_total });
+    }
+
+    fn file_done(&mut self) {
+        self.files_done += 1;
+        self.report();
+    }
+}
+
+/// Parses, chunks and embeds several files with one embedder call; touches no database. Advances
+/// `tracker.bytes_done` by the files' sizes, in steps as the embedder's forward passes finish.
 /// `dim`: the expected vector length, when known.
 fn prepare_many(
     files: Vec<(&ScannedFile, Vec<u8>, String)>,
     embedder: &mut LazyEmbedder,
     dim: Option<usize>,
+    tracker: &mut Tracker,
 ) -> Result<Vec<PreparedFile>> {
     if files.is_empty() {
         return Ok(Vec::new());
     }
-    let model = embedder.get()?;
+    let model = embedder.get(tracker.progress)?;
+    let group_start = tracker.bytes_done;
+    let group_bytes: u64 = files.iter().map(|f| f.0.size).sum();
     let mut parsed = Vec::with_capacity(files.len());
     for (scanned, bytes, sha) in files {
         let text = String::from_utf8_lossy(&bytes);
@@ -78,10 +124,21 @@ fn prepare_many(
     }
     let texts: Vec<&str> = parsed.iter().flat_map(|p| p.3.iter().map(|c| c.embed_text.as_str())).collect();
     let n = texts.len();
-    let vectors = if texts.is_empty() { Vec::new() } else { model.embed(&texts)? };
+    let text_bytes = texts.iter().map(|t| t.len() as u64).sum::<u64>().max(1);
+    let mut embedded = 0;
+    let vectors = if texts.is_empty() {
+        Vec::new()
+    } else {
+        model.embed_with_progress(&texts, &mut |batch| {
+            embedded += batch.iter().map(|&i| texts[i].len() as u64).sum::<u64>();
+            tracker.bytes_done = group_start + group_bytes * embedded / text_bytes;
+            tracker.report();
+        })?
+    };
     if vectors.len() != n {
         return Err(VltError::Internal(format!("embedder returned {} vectors for {n} chunks", vectors.len())));
     }
+    tracker.bytes_done = group_start + group_bytes;
     if let Some(dim) = dim {
         if let Some(v) = vectors.iter().find(|v| v.len() != dim) {
             return Err(VltError::Internal(format!(
@@ -144,7 +201,7 @@ pub fn reindex(
     vault: &Path,
     exclude: &GlobSet,
     embedder: EmbedderSource,
-    progress: &mut dyn FnMut(usize, usize),
+    progress: &mut dyn FnMut(Progress),
 ) -> Result<ReindexStats> {
     let scan = scanner::scan(vault, exclude)?;
     reindex_scan(conn, &scan, embedder, progress)
@@ -154,7 +211,7 @@ fn reindex_scan(
     conn: &mut Connection,
     scan: &Scan,
     embedder: EmbedderSource,
-    progress: &mut dyn FnMut(usize, usize),
+    progress: &mut dyn FnMut(Progress),
 ) -> Result<ReindexStats> {
     let states = db::file_states(conn)?;
     let mut stats = ReindexStats::default();
@@ -183,13 +240,14 @@ fn reindex_scan(
 
     let dim = db::read_meta(conn)?.map(|m| m.dim);
     let mut model = LazyEmbedder::new(embedder);
-    let total = pending.len();
-    let mut done = 0;
+    let files: Vec<&ScannedFile> = pending.iter().map(|p| p.0).collect();
+    let mut tracker = Tracker::start(progress, &files);
     let mut pending = pending.into_iter().peekable();
     while pending.peek().is_some() {
         let group: Vec<_> = pending.by_ref().take(FILES_PER_EMBED).collect();
         let flags: Vec<bool> = group.iter().map(|g| g.3).collect();
-        let prepared = prepare_many(group.into_iter().map(|(f, b, s, _)| (f, b, s)).collect(), &mut model, dim)?;
+        let prepared =
+            prepare_many(group.into_iter().map(|(f, b, s, _)| (f, b, s)).collect(), &mut model, dim, &mut tracker)?;
         for (p, is_new) in prepared.iter().zip(flags) {
             let tx = conn.transaction()?;
             write(&tx, p)?;
@@ -199,8 +257,7 @@ fn reindex_scan(
             } else {
                 stats.updated += 1;
             }
-            done += 1;
-            progress(done, total);
+            tracker.file_done();
         }
     }
 
@@ -222,7 +279,7 @@ pub fn rebuild(
     vault: &Path,
     exclude: &GlobSet,
     embedder: EmbedderSource,
-    progress: &mut dyn FnMut(usize, usize),
+    progress: &mut dyn FnMut(Progress),
 ) -> Result<ReindexStats> {
     let scan = scanner::scan(vault, exclude)?;
     rebuild_scan(conn, meta, &scan, embedder, progress)
@@ -233,14 +290,15 @@ fn rebuild_scan(
     meta: &IndexMeta,
     scan: &Scan,
     embedder: EmbedderSource,
-    progress: &mut dyn FnMut(usize, usize),
+    progress: &mut dyn FnMut(Progress),
 ) -> Result<ReindexStats> {
     let mut model = LazyEmbedder::new(embedder);
     let tx = conn.transaction()?;
     db::reset_schema(&tx, meta)?;
-    let total = scan.files.len();
+    let all: Vec<&ScannedFile> = scan.files.iter().collect();
+    let mut tracker = Tracker::start(progress, &all);
     let mut added = 0;
-    let mut done = 0;
+    let mut scanned_bytes = 0;
     for files in scan.files.chunks(FILES_PER_EMBED) {
         let mut group = Vec::with_capacity(files.len());
         for f in files {
@@ -249,13 +307,16 @@ fn rebuild_scan(
                 group.push((f, bytes, sha));
             }
         }
-        for p in prepare_many(group, &mut model, Some(meta.dim))? {
+        let vanished = files.len() - group.len();
+        for p in prepare_many(group, &mut model, Some(meta.dim), &mut tracker)? {
             write(&tx, &p)?;
             added += 1;
+            tracker.file_done();
         }
-        for _ in files {
-            done += 1;
-            progress(done, total);
+        scanned_bytes += files.iter().map(|f| f.size).sum::<u64>();
+        tracker.bytes_done = scanned_bytes;
+        for _ in 0..vanished {
+            tracker.file_done();
         }
     }
     db::set_excluded(&tx, &scan.excluded)?;
@@ -274,7 +335,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn meta() -> IndexMeta { IndexMeta { model_id: "fake".into(), dim: 384, fingerprint: "fake".into(), vault: "/v".into() } }
-    fn no_progress() -> impl FnMut(usize, usize) { |_, _| {} }
+    fn no_progress() -> impl FnMut(Progress) { |_| {} }
     fn count(c: &Connection, sql: &str) -> i64 { c.query_row(sql, [], |r| r.get(0)).unwrap() }
 
     struct Env { _d: tempfile::TempDir, vault: PathBuf, db: Db, calls: Arc<AtomicUsize> }
@@ -357,20 +418,60 @@ mod tests {
     }
 
     #[test]
-    fn embedder_is_loaded_once_per_run_and_progress_counts_indexed_files() {
+    fn embedder_is_loaded_once_per_run_and_progress_announces_the_model_then_counts_bytes_and_files() {
         let mut e = env();
         let src = counting_source(&e.calls);
         let ex = scanner::build_exclude(&[]).unwrap();
+        let bytes = fs::metadata(e.vault.join("notes/a.md")).unwrap().len() + fs::metadata(e.vault.join("b.md")).unwrap().len();
+        let indexed = |files_done| Progress::Indexed { files_done, files_total: 2, bytes_done: bytes, bytes_total: bytes };
+        let expected = vec![Progress::Started { files: 2, bytes }, Progress::LoadingModel, indexed(0), indexed(1), indexed(2)];
         let mut seen = Vec::new();
-        reindex(e.db.conn_mut(), &e.vault, &ex, &src, &mut |d, t| seen.push((d, t))).unwrap();
+        reindex(e.db.conn_mut(), &e.vault, &ex, &src, &mut |p| seen.push(p)).unwrap();
         assert_eq!(e.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(seen, vec![(1, 2), (2, 2)]);
+        assert_eq!(seen, expected);
         seen.clear();
-        reindex(e.db.conn_mut(), &e.vault, &ex, &src, &mut |d, t| seen.push((d, t))).unwrap();
-        assert!(seen.is_empty());
-        rebuild(e.db.conn_mut(), &meta(), &e.vault, &ex, &src, &mut |d, t| seen.push((d, t))).unwrap();
-        assert_eq!(seen, vec![(1, 2), (2, 2)]);
+        reindex(e.db.conn_mut(), &e.vault, &ex, &src, &mut |p| seen.push(p)).unwrap();
+        assert!(seen.is_empty(), "nothing to embed, nothing reported");
+        rebuild(e.db.conn_mut(), &meta(), &e.vault, &ex, &src, &mut |p| seen.push(p)).unwrap();
+        assert_eq!(seen, expected);
         assert_eq!(e.calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Records each call's size and reports a forward pass every 3 texts, as a real model does with long texts.
+    #[derive(Default)]
+    struct BatchingEmbedder { calls: std::sync::Mutex<Vec<usize>> }
+    impl Embedder for BatchingEmbedder {
+        fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> { FakeEmbedder.embed(texts) }
+        fn embed_with_progress(&self, texts: &[&str], on_batch: &mut dyn FnMut(&[usize])) -> Result<Vec<Vec<f32>>> {
+            self.calls.lock().unwrap().push(texts.len());
+            let all: Vec<usize> = (0..texts.len()).collect();
+            all.chunks(3).for_each(on_batch);
+            FakeEmbedder.embed(texts)
+        }
+        fn count_tokens(&self, text: &str) -> usize { FakeEmbedder.count_tokens(text) }
+    }
+
+    #[test]
+    fn a_large_note_reports_progress_after_each_forward_pass_of_one_call_per_group() {
+        let mut e = env();
+        let big: String = (0..40).map(|i| format!("## Section {i}\n\nText number {i}.\n\n")).collect();
+        fs::write(e.vault.join("big.md"), big).unwrap();
+        let rec = Arc::new(BatchingEmbedder::default());
+        let r = rec.clone();
+        let src = move || -> Result<Arc<dyn Embedder>> { Ok(r.clone()) };
+        let mut seen = Vec::new();
+        reindex(e.db.conn_mut(), &e.vault, &scanner::build_exclude(&[]).unwrap(), &src, &mut |p| seen.push(p)).unwrap();
+        let chunks = count(e.db.conn(), "SELECT count(*) FROM chunks") as usize;
+        assert_eq!(*rec.calls.lock().unwrap(), vec![chunks], "the whole group in one call, batched by the model");
+        let partial: Vec<u64> = seen
+            .iter()
+            .filter_map(|p| match *p {
+                Progress::Indexed { files_done: 0, bytes_done, bytes_total, .. } if bytes_done < bytes_total => Some(bytes_done),
+                _ => None,
+            })
+            .collect();
+        assert!(partial.len() >= 10, "{seen:?}");
+        assert!(partial.windows(2).all(|w| w[0] < w[1]), "{partial:?}");
     }
 
     #[test]
@@ -504,14 +605,18 @@ mod tests {
         let r = rec.clone();
         let src = move || -> Result<Arc<dyn Embedder>> { Ok(r.clone()) };
         let mut seen = Vec::new();
-        reindex(db.conn_mut(), &vault, &ex, &src, &mut |d, _| seen.push(d)).unwrap();
+        let mut files_done = |p| if let Progress::Indexed { files_done, .. } = p { seen.push(files_done) };
+        reindex(db.conn_mut(), &vault, &ex, &src, &mut files_done).unwrap();
+        seen.dedup();
         assert_eq!(*rec.calls.lock().unwrap(), vec![16, 16, 1], "one chunk per file");
-        assert_eq!(seen, (1..=33).collect::<Vec<_>>());
+        assert_eq!(seen, (0..=33).collect::<Vec<_>>());
         rec.calls.lock().unwrap().clear();
         seen.clear();
-        rebuild(db.conn_mut(), &meta(), &vault, &ex, &src, &mut |d, _| seen.push(d)).unwrap();
+        let mut files_done = |p| if let Progress::Indexed { files_done, .. } = p { seen.push(files_done) };
+        rebuild(db.conn_mut(), &meta(), &vault, &ex, &src, &mut files_done).unwrap();
+        seen.dedup();
         assert_eq!(*rec.calls.lock().unwrap(), vec![16, 16, 1]);
-        assert_eq!(seen, (1..=33).collect::<Vec<_>>());
+        assert_eq!(seen, (0..=33).collect::<Vec<_>>());
     }
 
     #[test]

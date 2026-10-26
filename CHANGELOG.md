@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `vlt install` and `vlt reindex` no longer look stuck while they index: they say how many notes and how much text they will embed, say when the embedding model is loading, and the progress line now advances after each pass of the embedding model (not every 16 notes), with the text embedded so far (`419/932 KB (44%)`) and an estimate of the time left.
+- The model download progress line clears itself on each redraw, so no stray characters from a longer previous line remain (`1136.4/1136.4 MB0.0/0.0 MB`).
+
 ## [0.3.0] - 2026-10-26
 
 ### Added
