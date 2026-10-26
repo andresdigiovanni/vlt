@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-26
+
 ### Added
 
 - Tags written in the body (`#tag`, `#nested/tag`) count as tags, as in Obsidian, and `get` lists every tag of a note, frontmatter and body, in a new `tags` field.
