@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-28
+
 ### Added
 
 - `move` (MCP tool) moves or renames a note the user approved, creating missing folders, and rewrites every link the move would break (backlinks, the note's own relative links, names it makes ambiguous) in the style each was written. It never overwrites (`already_exists`); `updated` lists each rewritten note with its diff. The Skill gains a Moving and deleting flow.
