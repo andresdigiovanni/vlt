@@ -2,7 +2,7 @@
 
 ## Project
 
-Rust CLI and stdio MCP server (`vlt`, package `vlt`): hybrid semantic search over a vault (a folder of markdown notes), backed by SQLite (FTS5 + sqlite-vec) and local Candle models. vlt writes to the vault only through the MCP tools `create` (new notes, never overwriting), `edit` and `update_properties`, when the agent calls them; everything else vlt owns lives under `~/.vlt/`.
+Rust CLI and stdio MCP server (`vlt`, package `vlt`): hybrid semantic search over a vault (a folder of markdown notes), backed by SQLite (FTS5 + sqlite-vec) and local Candle models. vlt writes to the vault only through the MCP tools `create` (new notes, never overwriting), `edit`, `update_properties`, `move` and `delete` (which moves notes to `.trash/` in the vault and removes only empty folders), when the agent calls them; everything else vlt owns lives under `~/.vlt/`.
 
 ## Validation
 

@@ -1,3 +1,4 @@
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
 use globset::GlobSet;
@@ -15,7 +16,7 @@ use crate::paths;
 use crate::related::{self, RelatedResponse};
 use crate::search::{self, SearchRequest, SearchResponse};
 use crate::storage::db::{self, Db, SCHEMA_VERSION};
-use crate::write::{self, Loaded, WriteResponse};
+use crate::write::{self, FileDiff, Loaded, DeleteResponse, MoveResponse, WriteResponse};
 use crate::{Result, VltError};
 
 pub struct App {
@@ -112,8 +113,10 @@ impl App {
         search::search(db.conn(), &self.cfg.search, embedder.as_ref(), reranker.as_ref(), req)
     }
 
-    /// Reads the document, applies `change` to its LF text, writes it atomically and reindexes.
-    fn write_document(&self, path: &str, change: impl FnOnce(&str) -> Result<String>) -> Result<WriteResponse> {
+    /// The absolute path of an existing `.md` regular file and its vault-relative path as stored on
+    /// disk (real case, through `canonicalize`). Does not apply `check_readable`: `edit` keeps working
+    /// on excluded notes as today.
+    fn existing_note(&self, path: &str) -> Result<(PathBuf, String)> {
         let abs = documents::resolve_in_vault(&self.cfg.vault, path)?;
         if !abs.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("md")) {
             return Err(VltError::InvalidArguments(format!("{path} is not a Markdown (.md) document")));
@@ -126,17 +129,15 @@ impl App {
             }
             Err(e) => return Err(e.into()),
         }
-        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let loaded = Loaded::read(&abs)?;
-        let updated = change(&loaded.lf)?;
-        let diff = write::diff_hunk(&loaded.lf, &updated);
-        write::atomic_replace(&abs, &loaded.bytes, &loaded.render(&updated))?;
-        let reindexed = matches!(self.reindex_incremental(), Ok(o) if o.reindexed);
-        Ok(WriteResponse { ok: true, path: path.to_string(), diff, reindexed })
+        let vault = std::fs::canonicalize(&self.cfg.vault)?;
+        let real = std::fs::canonicalize(&abs)?;
+        let rel = real.strip_prefix(&vault).map_err(|_| VltError::PathOutsideVault(path.to_string()))?;
+        Ok((abs, rel.to_string_lossy().into_owned()))
     }
 
-    /// Writes a new note at `path`; never replaces a file or folder that is there.
-    pub fn create(&self, path: &str, content: &str) -> Result<WriteResponse> {
+    /// Validates a path for a new note and creates its folders: the real absolute path and the
+    /// stored vault-relative path. Errors as `create` reports them; does not check existence.
+    fn new_note_path(&self, path: &str) -> Result<(PathBuf, String)> {
         let abs = documents::resolve_in_vault(&self.cfg.vault, path)?;
         let name = abs.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         if !abs.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("md")) {
@@ -144,14 +145,6 @@ impl App {
         }
         let requested = abs.strip_prefix(&self.cfg.vault).map_err(|e| VltError::Internal(e.to_string()))?;
         self.check_readable(path, &requested.to_string_lossy())?;
-        let lf = content.strip_prefix('\u{feff}').unwrap_or(content).replace("\r\n", "\n");
-        if let (_, Some(error), _, _) = split_frontmatter(&lf) {
-            return Err(VltError::InvalidFrontmatter(error));
-        }
-        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
-        if std::fs::symlink_metadata(&abs).is_ok() {
-            return Err(VltError::AlreadyExists(path.to_string()));
-        }
         let parent = abs.parent().ok_or_else(|| VltError::InvalidArguments(format!("{path} has no folder")))?;
         std::fs::create_dir_all(parent).map_err(|e| match e.kind() {
             std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotADirectory => {
@@ -170,12 +163,133 @@ impl App {
         }
         let stored = real_dir.join(&name).to_string_lossy().into_owned();
         self.check_readable(path, &stored)?;
-        write::create_new(&real_parent.join(&name), content.as_bytes()).map_err(|e| match e.kind() {
+        Ok((real_parent.join(&name), stored))
+    }
+
+    /// Reads the document, applies `change` to its LF text, writes it atomically and reindexes.
+    fn write_document(&self, path: &str, change: impl FnOnce(&str) -> Result<String>) -> Result<WriteResponse> {
+        let (abs, _) = self.existing_note(path)?;
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let loaded = Loaded::read(&abs)?;
+        let updated = change(&loaded.lf)?;
+        let diff = write::diff_hunk(&loaded.lf, &updated);
+        write::atomic_replace(&abs, &loaded.bytes, &loaded.render(&updated))?;
+        let reindexed = matches!(self.reindex_incremental(), Ok(o) if o.reindexed);
+        Ok(WriteResponse { ok: true, path: path.to_string(), diff, reindexed })
+    }
+
+    /// Writes a new note at `path`; never replaces a file or folder that is there.
+    pub fn create(&self, path: &str, content: &str) -> Result<WriteResponse> {
+        let lf = content.strip_prefix('\u{feff}').unwrap_or(content).replace("\r\n", "\n");
+        if let (_, Some(error), _, _) = split_frontmatter(&lf) {
+            return Err(VltError::InvalidFrontmatter(error));
+        }
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let (real_abs, stored) = self.new_note_path(path)?;
+        if std::fs::symlink_metadata(&real_abs).is_ok() {
+            return Err(VltError::AlreadyExists(path.to_string()));
+        }
+        write::create_new(&real_abs, content.as_bytes()).map_err(|e| match e.kind() {
             std::io::ErrorKind::AlreadyExists => VltError::AlreadyExists(path.to_string()),
             _ => e.into(),
         })?;
         let reindexed = matches!(self.reindex_incremental(), Ok(o) if o.reindexed);
         Ok(WriteResponse { ok: true, path: stored, diff: write::diff_hunk("", &lf), reindexed })
+    }
+
+    /// Moves or renames a note and rewrites the links the move would break. The rename is done once
+    /// the rewrites start: a note whose links could not be rewritten (changed meanwhile, unwritable) is
+    /// reported in `FilesChanged`, and the move is not undone.
+    pub fn move_note(&self, path: &str, new_path: &str) -> Result<MoveResponse> {
+        let (from_abs, from) = self.existing_note(path)?;
+        self.check_readable(path, &from)?;
+        if let Some(c) = new_path.split('/').flat_map(str::chars).find(|c| matches!(c, '#' | '|' | '[' | ']' | '^')) {
+            return Err(VltError::InvalidArguments(format!(
+                "{new_path} contains `{c}`: Obsidian links cannot point to a name with # | [ ] or ^"
+            )));
+        }
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let (to_abs, to) = self.new_note_path(new_path)?;
+        if to == from {
+            return Err(VltError::InvalidArguments(format!("{new_path} is the note's current path")));
+        }
+        if let Ok(m) = std::fs::symlink_metadata(&to_abs) {
+            let same = std::fs::metadata(&from_abs).is_ok_and(|f| (f.dev(), f.ino()) == (m.dev(), m.ino()));
+            if !(same && links::normalize(&to) == links::normalize(&from)) {
+                return Err(VltError::AlreadyExists(new_path.to_string()));
+            }
+        }
+        let rewrites = {
+            let db = self.open_for_read()?;
+            links::rewrites_for_move(&links::LinkIndex::load(db.conn())?, &links::load_links(db.conn())?, &from, &to)
+        };
+        std::fs::rename(&from_abs, &to_abs)?;
+        let (mut updated, mut changed) = (Vec::new(), Vec::new());
+        let mut srcs: Vec<&str> = rewrites.iter().map(|r| r.src.as_str()).collect();
+        srcs.dedup();
+        for src in srcs {
+            let edits: Vec<(usize, &str, &str)> = rewrites
+                .iter()
+                .filter(|r| r.src == src)
+                .map(|r| (r.line, r.raw.as_str(), r.new_raw.as_str()))
+                .collect();
+            let abs = self.cfg.vault.join(src);
+            let result = Loaded::read(&abs).and_then(|loaded| {
+                let new = write::replace_on_lines(&loaded.lf, &edits).ok_or(VltError::FileChanged)?;
+                write::atomic_replace(&abs, &loaded.bytes, &loaded.render(&new))?;
+                Ok(write::diff_hunk(&loaded.lf, &new))
+            });
+            match result {
+                Ok(diff) => updated.push(FileDiff { path: src.to_string(), diff }),
+                Err(_) => changed.push(src.to_string()),
+            }
+        }
+        let reindexed = matches!(self.reindex_incremental(), Ok(o) if o.reindexed);
+        if !changed.is_empty() {
+            return Err(VltError::FilesChanged(changed));
+        }
+        Ok(MoveResponse { ok: true, path: to, from, updated, reindexed })
+    }
+
+    /// Deletes a note by moving it to `.trash/`, or removes a folder holding only folders and
+    /// `.DS_Store`. `broken_links` lists the links to the note that now point nowhere.
+    pub fn delete(&self, path: &str) -> Result<DeleteResponse> {
+        let abs = documents::resolve_in_vault(&self.cfg.vault, path)?;
+        let rel = abs.strip_prefix(&self.cfg.vault).map_err(|e| VltError::Internal(e.to_string()))?.to_string_lossy().into_owned();
+        if rel.is_empty() {
+            return Err(VltError::InvalidArguments("the vault root cannot be deleted".into()));
+        }
+        self.check_readable(path, &rel)?;
+        match std::fs::symlink_metadata(&abs) {
+            Ok(m) if m.is_dir() => {
+                let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+                write::remove_empty_tree(&abs, &rel)?;
+                let reindexed = matches!(self.reindex_incremental(), Ok(o) if o.reindexed);
+                return Ok(DeleteResponse { ok: true, path: rel, trashed_to: None, broken_links: Vec::new(), reindexed });
+            }
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => {
+                return Err(VltError::DocumentNotFound(path.to_string()))
+            }
+            _ => {}
+        }
+        let (abs, rel) = self.existing_note(path)?;
+        self.check_readable(path, &rel)?;
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let broken_links = {
+            let db = self.open_for_read()?;
+            links::LinkIndex::load(db.conn())?.backlinks(db.conn(), &rel)?
+        };
+        let trashed = write::trash_path(&self.cfg.vault, &rel);
+        let dest = documents::resolve_in_vault(&self.cfg.vault, &trashed)?;
+        let dest_dir = dest.parent().expect("under .trash");
+        std::fs::create_dir_all(dest_dir)?;
+        let trash_root = std::fs::canonicalize(&self.cfg.vault)?.join(".trash");
+        if !std::fs::canonicalize(dest_dir)?.starts_with(&trash_root) {
+            return Err(VltError::PathOutsideVault(trashed));
+        }
+        std::fs::rename(&abs, &dest)?;
+        let reindexed = matches!(self.reindex_incremental(), Ok(o) if o.reindexed);
+        Ok(DeleteResponse { ok: true, path: rel, trashed_to: Some(trashed), broken_links, reindexed })
     }
 
     /// Rejects a vault-relative path the index would skip, so a created note can be read back.

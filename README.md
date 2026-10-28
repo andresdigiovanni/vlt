@@ -31,7 +31,7 @@ flowchart LR
 
 - **Hybrid search**: keyword search (SQLite FTS5) and semantic search (sqlite-vec) over the sections of every note, the best of each fused with Reciprocal Rank Fusion and reranked by a local cross-encoder. Results below a relevance threshold are dropped, so "nothing relevant" is an answer, not five random hits.
 - **Filters**: by frontmatter property (`status=in_progress`, `tags=rust`, `date>=2026-01-01`) and by folder. A tag also matches its nested tags: `tags=project` finds `project/vlt`. `tags` covers the frontmatter and `#tags` written in the body, as in Obsidian. `tags=#rust` and `tags=rust` are the same filter.
-- **Enrichment on request**: ask the agent to "process the note X" and it proposes properties that match your vault's vocabulary, links from and to related notes, and fixes for broken links. It writes only the changes you pick.
+- **Enrichment on request**: ask the agent to "process the note X" and it proposes properties that match your vault's vocabulary, links from and to related notes, and fixes for broken links. It writes only the changes you pick. It can also move, rename or delete a note when you ask: links that the move would break are rewritten, and a deleted note goes to `.trash/` in the vault.
 - **Local models**: embeddings and reranking run on your CPU with [Candle](https://github.com/huggingface/candle). Pick any Hugging Face model of a [supported architecture](#models). Models are downloaded once, checked against the hashes Hugging Face publishes, and locked to that commit; vlt works offline afterwards.
 
 ## Quick start
@@ -218,7 +218,7 @@ Errors are printed to stderr as `error: <message>` with exit code 1.
 
 ## MCP tools
 
-The server is named `vlt`. It exposes ten tools:
+The server is named `vlt`. It exposes twelve tools:
 
 | Tool | Purpose |
 |---|---|
@@ -232,10 +232,12 @@ The server is named `vlt`. It exposes ten tools:
 | `edit` | Replaces one exact fragment of a document's body. Parameters: `path`, `old_text`, `new_text`. |
 | `update_properties` | Adds, changes or removes frontmatter properties of a document, keeping the rest of the file as it is. Parameters: `path`, `set`, `unset`. |
 | `create` | Writes a new note (`path`, `content`: the whole file), creating missing folders. Never overwrites: an existing path is `already_exists`; excluded paths are rejected. |
+| `move` | Moves or renames a note (`path`, `new_path`), creating missing folders, and rewrites the links the move would break (backlinks, the note's own relative links, names it makes ambiguous) in the style each was written; `updated` lists each rewritten note with its diff. Never overwrites: an existing path is `already_exists`; a name with `#`, `|`, `[`, `]` or `^` is rejected (`invalid_arguments`). |
+| `delete` | Moves a note (`path`) to `.trash/` in the vault (`trashed_to`), or removes an empty folder. `broken_links` lists the links to the note that now point nowhere. |
 
 ### What vlt writes
 
-`edit`, `update_properties` and `create` are the only tools that write to the vault: the first two change existing `.md` files inside it, and `create` writes new ones, never over an existing file. The agent calls them for the changes and drafts you approve. vlt never moves or deletes documents, and the `vlt` CLI never writes to them.
+`edit`, `update_properties`, `create`, `move` and `delete` are the only tools that write to the vault: `edit` and `update_properties` change existing `.md` files inside it, `create` writes new ones, never over an existing file, `move` moves or renames a note (to another folder too) and rewrites the links it would break, and `delete` moves a note to `.trash/` in the vault (it is never erased) and removes only empty folders. The agent calls them for the changes, drafts, moves and deletions you approve. The `vlt` CLI never writes to your notes.
 
 ## Configuration
 
@@ -310,7 +312,7 @@ flowchart LR
     vlt --- index
     vlt --- models
     vlt -- "reads changed notes" --> vault[/"your vault<br/>markdown notes"/]
-    vlt -. "create · edit · update_properties<br/>only what you approve" .-> vault
+    vlt -. "create · edit · update_properties · move · delete<br/>only what you approve" .-> vault
 ```
 
 ```text
@@ -320,7 +322,7 @@ flowchart LR
 └── models/       # embedding and reranking models
 ```
 
-Your vault stays exactly as it is: vlt keeps nothing inside it and only writes there through `create`, `edit` and `update_properties`, when you approve a change.
+Your vault stays as it is: vlt keeps nothing inside it except the `.trash/` folder that `delete` moves notes to, and only writes there through `create`, `edit`, `update_properties`, `move` and `delete`, when you approve a change.
 
 ## Uninstall
 

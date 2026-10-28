@@ -28,6 +28,8 @@ pub enum VltError {
     InvalidFrontmatter(String),
     #[error("{0} already exists; choose another path, or process that note")]
     AlreadyExists(String),
+    #[error("the note was moved, but the links in these notes were not rewritten: {}; `get` each and fix its links with `edit`", .0.join(", "))]
+    FilesChanged(Vec<String>),
 }
 
 impl VltError {
@@ -39,7 +41,7 @@ impl VltError {
             VltError::IndexRebuildRequired(_) => "index_rebuild_required",
             VltError::NotFound => "not_found",
             VltError::Ambiguous(_) => "ambiguous",
-            VltError::FileChanged => "file_changed",
+            VltError::FileChanged | VltError::FilesChanged(_) => "file_changed",
             VltError::InvalidFrontmatter(_) => "invalid_frontmatter",
             VltError::AlreadyExists(_) => "already_exists",
             _ => "internal",
@@ -65,5 +67,6 @@ mod tests {
         assert_eq!(VltError::FileChanged.code(), "file_changed");
         assert_eq!(VltError::InvalidFrontmatter("x".into()).code(), "invalid_frontmatter");
         assert_eq!(VltError::AlreadyExists("x".into()).code(), "already_exists");
+        assert_eq!(VltError::FilesChanged(vec!["a.md".into()]).code(), "file_changed");
     }
 }

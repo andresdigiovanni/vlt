@@ -8,7 +8,7 @@ use crate::app::App;
 use crate::search::SearchRequest;
 use crate::VltError;
 
-const INSTRUCTIONS: &str = "vlt: search the user's markdown knowledge base (hybrid search), read documents, inspect properties and, when the user approves, create notes and edit documents and their properties. Read and write the vault only through these tools.";
+const INSTRUCTIONS: &str = "vlt: search the user's markdown knowledge base (hybrid search), read documents, inspect properties and, when the user approves, create notes, edit documents and their properties, and move or delete notes. Read and write the vault only through these tools.";
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct SearchArgs {
@@ -82,6 +82,20 @@ struct CreateArgs {
     path: String,
     /// The whole file, frontmatter included, exactly as the user approved it.
     content: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct MoveArgs {
+    /// Vault-relative path of the note to move or rename.
+    path: String,
+    /// Its new vault-relative path, ending in `.md`.
+    new_path: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct DeleteArgs {
+    /// Vault-relative path of a note (`.md`) or of an empty folder.
+    path: String,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -291,6 +305,31 @@ impl VltServer {
             Err(e) => return Ok(tool_error(&e)),
         };
         Ok(self.call(move |app| app.create(&a.path, &a.content)).await)
+    }
+
+    #[tool(
+        name = "move",
+        description = "Moves or renames a note to `new_path` (vault-relative `.md`), creating missing folders, and rewrites every link the move would break (backlinks, the note's own relative links, names it makes ambiguous) in the style each was written; `updated` lists each rewritten note with its diff. Never overwrites: a path that exists is `already_exists`; a name with # | [ ] ^ is rejected (`invalid_arguments`). Only call it for a move the user approved.",
+        input_schema = input_schema::<MoveArgs>()
+    )]
+    async fn move_note(&self, args: JsonObject) -> Result<CallToolResult, ErrorData> {
+        let a = match parse_args::<MoveArgs>(args) {
+            Ok(a) => a,
+            Err(e) => return Ok(tool_error(&e)),
+        };
+        Ok(self.call(move |app| app.move_note(&a.path, &a.new_path)).await)
+    }
+
+    #[tool(
+        description = "Deletes a note by moving it to `.trash/` in the vault (`trashed_to`), or removes an empty folder (one holding only folders and `.DS_Store`). `broken_links` lists the links to the note that now point nowhere: show the note's backlinks from `get` to the user before asking to delete it. Only call it for a deletion the user approved.",
+        input_schema = input_schema::<DeleteArgs>()
+    )]
+    async fn delete(&self, args: JsonObject) -> Result<CallToolResult, ErrorData> {
+        let a = match parse_args::<DeleteArgs>(args) {
+            Ok(a) => a,
+            Err(e) => return Ok(tool_error(&e)),
+        };
+        Ok(self.call(move |app| app.delete(&a.path)).await)
     }
 
     #[tool(

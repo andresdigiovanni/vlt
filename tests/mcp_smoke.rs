@@ -60,9 +60,11 @@ fn mcp_lists_and_calls_tools() {
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
     names.sort();
-    assert_eq!(names, vec!["audit", "create", "edit", "folders", "get", "properties", "reindex", "related", "search", "update_properties"]);
+    assert_eq!(names, vec!["audit", "create", "delete", "edit", "folders", "get", "move", "properties", "reindex", "related", "search", "update_properties"]);
     assert_eq!(schema("edit")["required"], json!(["path", "old_text", "new_text"]));
     assert_eq!(schema("create")["required"], json!(["path", "content"]));
+    assert_eq!(schema("move")["required"], json!(["path", "new_path"]));
+    assert_eq!(schema("delete")["required"], json!(["path"]));
     assert_eq!(schema("update_properties")["required"], json!(["path"]));
     assert!(schema("update_properties")["properties"]["unset"].is_object());
 

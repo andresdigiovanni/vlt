@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `move` (MCP tool) moves or renames a note the user approved, creating missing folders, and rewrites every link the move would break (backlinks, the note's own relative links, names it makes ambiguous) in the style each was written. It never overwrites (`already_exists`); `updated` lists each rewritten note with its diff. The Skill gains a Moving and deleting flow.
+- `delete` (MCP tool) deletes a note the user approved by moving it to `.trash/` in the vault (`trashed_to`), or removes an empty folder. `broken_links` lists the links to the note that now point nowhere, so the agent can offer to fix them with `edit`.
+
 ### Fixed
 
 - `vlt install` and `vlt reindex` no longer look stuck while they index: they say how many notes and how much text they will embed, say when the embedding model is loading, and the progress line now advances after each pass of the embedding model (not every 16 notes), with the text embedded so far (`419/932 KB (44%)`) and an estimate of the time left.

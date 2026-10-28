@@ -1,6 +1,6 @@
 ---
 name: vlt
-description: Searches and enriches the user's own markdown notes (their vault) through the vlt MCP tools. Use when the user asks what they know or wrote about something ("what do I know about X", "check my notes on X"); when the task depends on something only their notes would hold (one of their projects, a past decision, a personal convention); when they ask to process the note X, add properties to it, or link it with other notes; when they ask you to draft a new note for the vault; or when they ask you to audit the vault or one of its folders. Not for general knowledge (language syntax, public APIs), and not to move or delete notes.
+description: Searches and enriches the user's own markdown notes (their vault) through the vlt MCP tools. Use when the user asks what they know or wrote about something ("what do I know about X", "check my notes on X"); when the task depends on something only their notes would hold (one of their projects, a past decision, a personal convention); when they ask to process the note X, add properties to it, or link it with other notes; when they ask you to draft a new note for the vault; when they ask you to audit the vault or one of its folders; or when they ask to move, rename or delete a note. Not for general knowledge (language syntax, public APIs).
 ---
 
 # vlt
@@ -8,8 +8,8 @@ description: Searches and enriches the user's own markdown notes (their vault) t
 The vault is the user's folder of markdown notes: their projects, decisions and conventions. vlt indexes it and serves it through MCP tools.
 
 - **Touch the vault only through the vlt tools**, never with native file or shell tools: vlt keeps paths inside the vault, preserves the frontmatter format and reindexes after every write.
-- **Write only what the user picked.** `edit` and `update_properties` run only for items the user chose from your numbered list ("apply 1, 3"); `create` only for a draft the user approved. Even when the request names the exact change, show it as a one-item list and wait.
-- **vlt creates a note only through `create`**, for a draft the user approved (Drafting a new note); it never overwrites, moves or deletes notes.
+- **Write only what the user picked.** `edit` and `update_properties` run only for items the user chose from your numbered list ("apply 1, 3"); `create` only for a draft the user approved; `move` and `delete` only for a move or deletion the user approved. Even when the request names the exact change, show it as a one-item list and wait.
+- **vlt creates a note only through `create`**, for a draft the user approved (Drafting a new note); it never overwrites a note; `delete` moves a note to `.trash/` in the vault, and removes only empty folders.
 
 You never need `reindex` in these flows: every read tool picks up outside changes first, and every write reindexes.
 
@@ -24,7 +24,7 @@ You never need `reindex` in these flows: every read tool picks up outside change
 | asks for one specific property or link change | Enriching, that change only (skip the searches it does not need) |
 | asks to create a note, or to write something up as a note | Drafting a new note |
 | asks to audit, check or clean up the vault, or a folder of it | Auditing the vault |
-| asks to move or delete a note | None: say vlt cannot, and what the user would do in their editor |
+| asks to move, rename or delete a note, or delete an empty folder | Moving and deleting |
 
 Never start Enriching on your own. While answering, if you notice a missing property, a missing link or an outdated note, say so in one line and offer to process it.
 
@@ -53,6 +53,13 @@ You draft the note; once the user approves it, `create` writes it.
 5. Show the path and the whole file, frontmatter included, in one code block, and wait.
 6. On approval, `create({"path": "<path>", "content": "<file>"})` with exactly that path and file. On `already_exists`, say so and propose another path, or offer to process the note that is there.
 7. Then `get` the `path` `create` returned (it may differ in case from the one you sent) and offer Enriching groups c and d: a new note has no backlinks yet, and links to it are what lead other sections to it.
+
+## Moving and deleting
+
+`move` and `delete` change the vault's structure; run each only once the user approved it.
+
+- **Move or rename**: state the old path and the new path, and wait for approval. Then `move({"path": "<old>", "new_path": "<new>"})`: it rewrites the links the move would break, and `updated` lists each rewritten note. Report those paths; never fix links by hand afterwards. A path that already exists is `already_exists`; a name containing `#`, `|`, `[`, `]` or `^` is rejected (`invalid_arguments`): Obsidian links cannot point to it, so propose another name.
+- **Delete**: `get` the note and show its `backlinks`: they will point nowhere. Ask, and on approval `delete({"path": "<path>"})`. Report `trashed_to` (the note is in `.trash/` in the vault, so the user can restore it) and `broken_links`, and offer to fix those links with `edit`, one numbered item per link, applied as picked. A folder skips the `get` and backlinks step: confirm with the user, then `delete` with its path. It removes only a folder holding nothing but folders and `.DS_Store`; any other file in it makes `delete` refuse, and the folder stays.
 
 ## Auditing the vault
 
@@ -120,7 +127,7 @@ Errors arrive as `{"error": {"code": ..., "message": ...}}`. Retry at most once.
 - `invalid_arguments`: fix the call as the message says.
 - `not_found`: `old_text` is not in the body. `get` the document again and copy it from the new `content`.
 - `ambiguous`: `old_text` appears more than once; widen it until it is unique.
-- `file_changed`: the file changed during the write and nothing was saved. `get` it again and rebuild the change.
+- `file_changed`: the file changed during the write and nothing was saved. `get` it again and rebuild the change. After `move`, the note is already moved; the message names the notes whose links were not rewritten: `get` each and fix its links with `edit`.
 - `invalid_frontmatter`: the YAML does not parse. Ask the user to fix it in their editor; never repair it with `edit`. For a draft sent to `create`, fix its frontmatter and show it again.
 - `already_exists`: a note or folder is already at that path, and nothing was written. Propose another path, or offer to process the note that is there.
 - `internal`: if the message says the index is being built, retry shortly; otherwise report it and do not retry.

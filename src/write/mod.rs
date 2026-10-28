@@ -6,6 +6,7 @@ use std::path::Path;
 
 use crate::error::{Result, VltError};
 use crate::indexer::parser::split_frontmatter;
+use crate::links::Backlink;
 
 pub(crate) mod frontmatter;
 
@@ -14,6 +15,30 @@ pub struct WriteResponse {
     pub ok: bool,
     pub path: String,
     pub diff: String,
+    pub reindexed: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct FileDiff {
+    pub path: String,
+    pub diff: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct MoveResponse {
+    pub ok: bool,
+    pub path: String,
+    pub from: String,
+    pub updated: Vec<FileDiff>,
+    pub reindexed: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct DeleteResponse {
+    pub ok: bool,
+    pub path: String,
+    pub trashed_to: Option<String>,
+    pub broken_links: Vec<Backlink>,
     pub reindexed: bool,
 }
 
@@ -126,6 +151,56 @@ pub(crate) fn atomic_replace(path: &Path, original: &[u8], new: &[u8]) -> Result
     result
 }
 
+/// `.trash/<rel>`, or `.trash/<rel stem> N.md` for the first N >= 1 that is free.
+pub(crate) fn trash_path(vault: &Path, rel: &str) -> String {
+    let first = format!(".trash/{rel}");
+    if fs::symlink_metadata(vault.join(&first)).is_err() {
+        return first;
+    }
+    let (stem, ext) = match rel.rfind('.') {
+        Some(i) => rel.split_at(i),
+        None => (rel, ""),
+    };
+    (1..)
+        .map(|n| format!(".trash/{stem} {n}{ext}"))
+        .find(|c| fs::symlink_metadata(vault.join(c)).is_err())
+        .expect("an unbounded range has a free name")
+}
+
+/// Removes `dir` when its tree holds no file other than `.DS_Store`; otherwise `InvalidArguments`
+/// naming one such file (`shown` + its path below `dir`), and nothing is removed.
+pub(crate) fn remove_empty_tree(dir: &Path, shown: &str) -> Result<()> {
+    fn walk(dir: &Path, below: &str, shown: &str, dirs: &mut Vec<std::path::PathBuf>, junk: &mut Vec<std::path::PathBuf>) -> Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rel = if below.is_empty() { name.clone() } else { format!("{below}/{name}") };
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                walk(&entry.path(), &rel, shown, dirs, junk)?;
+                dirs.push(entry.path());
+            } else if name == ".DS_Store" {
+                junk.push(entry.path());
+            } else {
+                return Err(VltError::InvalidArguments(format!(
+                    "{shown} is not empty: it holds {shown}/{rel}; only an empty folder can be deleted"
+                )));
+            }
+        }
+        Ok(())
+    }
+    let (mut dirs, mut junk) = (Vec::new(), Vec::new());
+    walk(dir, "", shown, &mut dirs, &mut junk)?;
+    for file in junk {
+        fs::remove_file(file)?;
+    }
+    for sub in dirs {
+        fs::remove_dir(sub)?;
+    }
+    fs::remove_dir(dir)?;
+    Ok(())
+}
+
 /// Writes `new` to a file that must not exist yet: the exclusive create never replaces a file and never
 /// follows a symlink at `path`. A failed write removes the partial file.
 pub(crate) fn create_new(path: &Path, new: &[u8]) -> std::io::Result<()> {
@@ -163,6 +238,42 @@ pub(crate) fn edit_text(lf: &str, old: &str, new: &str) -> Result<String> {
     }
     let at = body_start + first;
     Ok(format!("{}{}{}", &lf[..at], new, &lf[at + old.len()..]))
+}
+
+/// Replaces every `raw` on its 1-based `line` of LF text, longest `raw` first so `[[a]]` never rewrites
+/// the inside of `![[a]]`; `None` when a line is missing or its original text lacks a `raw`.
+pub(crate) fn replace_on_lines(lf: &str, edits: &[(usize, &str, &str)]) -> Option<String> {
+    let mut lines: Vec<String> = lf.split_inclusive('\n').map(str::to_string).collect();
+    for &(line, raw, _) in edits {
+        if !lines.get(line.checked_sub(1)?)?.contains(raw) {
+            return None;
+        }
+    }
+    for (i, original) in lf.split_inclusive('\n').enumerate() {
+        let mut here: Vec<(&str, &str)> =
+            edits.iter().filter(|e| e.0 == i + 1).map(|&(_, raw, new_raw)| (raw, new_raw)).collect();
+        if here.is_empty() {
+            continue;
+        }
+        here.sort_by_key(|&(raw, _)| std::cmp::Reverse(raw.len()));
+        // One left-to-right pass over the original line, so a rewrite's output is never rewritten again.
+        let mut out = String::with_capacity(original.len());
+        let mut rest = original;
+        while let Some(c) = rest.chars().next() {
+            match here.iter().find(|(raw, _)| !raw.is_empty() && rest.starts_with(raw)) {
+                Some(&(raw, new_raw)) => {
+                    out.push_str(new_raw);
+                    rest = &rest[raw.len()..];
+                }
+                None => {
+                    out.push(c);
+                    rest = &rest[c.len_utf8()..];
+                }
+            }
+        }
+        lines[i] = out;
+    }
+    Some(lines.concat())
 }
 
 #[cfg(test)]
@@ -300,5 +411,22 @@ mod tests {
     fn edit_matches_across_lines_whatever_the_line_endings_of_the_arguments() {
         let t = "a\nb\nc\n";
         assert_eq!(edit_text(t, "a\r\nb", "A\r\nB").unwrap(), "A\nB\nc\n");
+    }
+
+    #[test]
+    fn replace_on_lines_replaces_every_occurrence_on_the_line_only() {
+        let lf = "[[a]] [[a]]\n[[a]]\n";
+        assert_eq!(replace_on_lines(lf, &[(1, "[[a]]", "[[b]]")]).as_deref(), Some("[[b]] [[b]]\n[[a]]\n"));
+        assert_eq!(replace_on_lines(lf, &[(3, "[[a]]", "[[b]]")]), None);
+        assert_eq!(replace_on_lines(lf, &[(2, "[[z]]", "[[b]]")]), None);
+        let both = "[[a]] ![[a]]\n";
+        assert_eq!(replace_on_lines(both, &[(1, "[[a]]", "[[b]]"), (1, "![[a]]", "![[b]]")]).as_deref(), Some("[[b]] ![[b]]\n"));
+    }
+
+    #[test]
+    fn replace_on_lines_never_rewrites_text_an_earlier_edit_produced() {
+        let lf = "[a](../y.md) [a](y.md)\n";
+        let edits = [(1, "[a](../y.md)", "[a](y.md)"), (1, "[a](y.md)", "[a](p/y.md)")];
+        assert_eq!(replace_on_lines(lf, &edits).as_deref(), Some("[a](y.md) [a](p/y.md)\n"));
     }
 }
