@@ -7,7 +7,8 @@
 #   ./install.sh [--version vX.Y.Z]
 #
 # Installs to ~/.local/bin/vlt (no sudo). Verifies the download against the
-# published SHA256SUMS. Re-running upgrades in place.
+# published SHA256SUMS, then runs `vlt install`. Re-running upgrades in place
+# and refreshes the setup of the agents that have the vlt Skill.
 set -euo pipefail
 
 REPO="andresdigiovanni/vlt"
@@ -18,7 +19,8 @@ usage() {
   cat <<EOF
 Usage: install.sh [--version vX.Y.Z]
 
-Installs the vlt binary from GitHub Releases ($REPO) into ~/.local/bin.
+Installs the vlt binary from GitHub Releases ($REPO) into ~/.local/bin,
+then runs \`vlt install\` (without asking when vlt is already set up).
 
 Options:
   --version vX.Y.Z   Install a specific release instead of the latest one.
@@ -148,7 +150,27 @@ case ":$PATH:" in
     ;;
 esac
 
-cat <<EOF
+# --- setup: `vlt install` refreshes the Skill embedded in the binary ---
+# Already set up: rerun it without asking, for the agents that have the Skill.
+# Otherwise ask on the terminal, which is not stdin under `curl | bash`.
+VLT_CONFIG="${VLT_HOME:-$HOME/.vlt}/config.toml"
+SETUP=()
+if [ -f "$VLT_CONFIG" ]; then
+  [ -f "$HOME/.claude/skills/vlt/SKILL.md" ] && SETUP+=(--target claude)
+  [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/skills/vlt/SKILL.md" ] && SETUP+=(--target opencode)
+  [ -f "$HOME/.codex/skills/vlt/SKILL.md" ] && SETUP+=(--target codex)
+fi
+
+if [ ${#SETUP[@]} -gt 0 ]; then
+  echo
+  echo "==> Updating the setup: vlt install --yes ${SETUP[*]}"
+  "$BIN_DIR/vlt" install --yes "${SETUP[@]}" || setup_failed=1
+elif (: </dev/tty) 2>/dev/null; then
+  echo
+  echo "==> Setting up vlt (vault, models, MCP server and Skill for your agent)"
+  "$BIN_DIR/vlt" install </dev/tty || setup_failed=1
+else
+  cat <<EOF
 
 Next step: set up vlt (vault, models, MCP server and Skill for your agent):
 
@@ -156,3 +178,12 @@ Next step: set up vlt (vault, models, MCP server and Skill for your agent):
 
 Docs: https://github.com/$REPO#readme
 EOF
+  exit 0
+fi
+
+if [ -n "${setup_failed:-}" ]; then
+  echo "error: vlt is installed, but its setup did not finish; run it again with: vlt install" >&2
+  exit 1
+fi
+echo
+echo "Docs: https://github.com/$REPO#readme"

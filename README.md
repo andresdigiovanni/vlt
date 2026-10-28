@@ -42,9 +42,11 @@ flowchart LR
 curl -fsSL https://raw.githubusercontent.com/andresdigiovanni/vlt/main/install.sh | bash
 ```
 
-The script downloads the prebuilt binary for your platform (macOS or Linux, x86_64 or aarch64) from GitHub Releases, verifies its SHA256 checksum and installs it to `~/.local/bin/vlt`. Make sure `~/.local/bin` is on your `PATH`.
+The script downloads the prebuilt binary for your platform (macOS or Linux, x86_64 or aarch64) from GitHub Releases, verifies its SHA256 checksum, installs it to `~/.local/bin/vlt` and runs `vlt install` to set it up. Make sure `~/.local/bin` is on your `PATH`.
 
 ### 2. Set it up
+
+The script starts `vlt install` for you. Without a terminal to ask on (in CI, for example), it prints the command instead; run it yourself:
 
 ```bash
 vlt install
@@ -107,7 +109,9 @@ curl -fsSL https://raw.githubusercontent.com/andresdigiovanni/vlt/main/install.s
 
 ### Upgrade
 
-Run the install script again; it replaces the binary in `~/.local/bin`. Your config, index and models are kept.
+Run the install script again. It replaces the binary in `~/.local/bin`, then reruns `vlt install --yes` for each agent that has the vlt Skill, so the Skill and the MCP server entry match the new version, without asking. Your config, index and models are kept; models are downloaded only if the new version's defaults changed.
+
+If you upgrade the binary some other way, run `vlt install` afterwards to update the Skill: it is embedded in the binary.
 
 ### Manual MCP configuration
 
