@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-05
+
 ### Changed
 
 - `install.sh` runs `vlt install` after installing the binary. On an upgrade it reruns `vlt install --yes` for each agent that has the vlt Skill, so the Skill is no longer left at the previous version. On a first install it asks on the terminal, and without one it prints the command as before.
