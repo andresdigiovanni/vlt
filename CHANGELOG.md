@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - `install.sh` runs `vlt install` after installing the binary. On an upgrade it reruns `vlt install --yes` for each agent that has the vlt Skill, so the Skill is no longer left at the previous version. On a first install it asks on the terminal, and without one it prints the command as before.
+- Reindexing a changed note embeds only the passages whose text changed and keeps the stored vectors of the rest, so `edit` on a 111 KB note takes about 1 s instead of about 80 s, and `update_properties` embeds nothing unless the title changes.
 
 ## [0.4.0] - 2026-10-28
 

@@ -2,7 +2,7 @@ pub mod chunker;
 pub mod parser;
 pub mod scanner;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -100,11 +100,15 @@ impl<'p> Tracker<'p> {
     }
 }
 
-/// Parses, chunks and embeds several files with one embedder call; touches no database. Advances
-/// `tracker.bytes_done` by the files' sizes, in steps as the embedder's forward passes finish.
-/// `dim`: the expected vector length, when known.
+/// A file to prepare: its bytes, their sha256, and the vectors it already has by chunk text.
+type FileToPrepare<'a> = (&'a ScannedFile, Vec<u8>, String, HashMap<String, Vec<f32>>);
+
+/// Parses, chunks and embeds several files with one embedder call; touches no database. A chunk
+/// whose text is a key of its file's `known` map takes that vector instead of being embedded.
+/// Advances `tracker.bytes_done` by the files' sizes, in steps as the embedder's forward passes
+/// finish. `dim`: the expected vector length, when known.
 fn prepare_many(
-    files: Vec<(&ScannedFile, Vec<u8>, String)>,
+    files: Vec<FileToPrepare>,
     embedder: &mut LazyEmbedder,
     dim: Option<usize>,
     tracker: &mut Tracker,
@@ -116,13 +120,16 @@ fn prepare_many(
     let group_start = tracker.bytes_done;
     let group_bytes: u64 = files.iter().map(|f| f.0.size).sum();
     let mut parsed = Vec::with_capacity(files.len());
-    for (scanned, bytes, sha) in files {
+    for (scanned, bytes, sha, known) in files {
         let text = String::from_utf8_lossy(&bytes);
         let doc = parser::parse(&text, file_stem(&scanned.rel_path));
         let chunks = chunker::chunk(&scanned.rel_path, &doc, MAX_TOKENS, &|t: &str| model.count_tokens(t));
-        parsed.push((scanned, sha, doc, chunks));
+        parsed.push((scanned, sha, doc, chunks, known));
     }
-    let texts: Vec<&str> = parsed.iter().flat_map(|p| p.3.iter().map(|c| c.embed_text.as_str())).collect();
+    let texts: Vec<&str> = parsed
+        .iter()
+        .flat_map(|p| p.3.iter().map(|c| c.embed_text.as_str()).filter(|t| !p.4.contains_key(*t)))
+        .collect();
     let n = texts.len();
     let text_bytes = texts.iter().map(|t| t.len() as u64).sum::<u64>().max(1);
     let mut embedded = 0;
@@ -149,10 +156,16 @@ fn prepare_many(
     }
     let mut vectors = vectors.into_iter();
     let mut out = Vec::with_capacity(parsed.len());
-    for (scanned, sha, doc, chunks) in parsed {
+    for (scanned, sha, doc, chunks, known) in parsed {
         let chunks = chunks
             .into_iter()
-            .zip(vectors.by_ref())
+            .map(|c| {
+                let embedding = match known.get(&c.embed_text) {
+                    Some(v) => v.clone(),
+                    None => vectors.next().expect("one vector per embedded chunk"),
+                };
+                (c, embedding)
+            })
             .map(|(c, embedding)| ChunkRow {
                 chunk_id: c.chunk_id,
                 section_id: c.section_id,
@@ -246,8 +259,12 @@ fn reindex_scan(
     while pending.peek().is_some() {
         let group: Vec<_> = pending.by_ref().take(FILES_PER_EMBED).collect();
         let flags: Vec<bool> = group.iter().map(|g| g.3).collect();
-        let prepared =
-            prepare_many(group.into_iter().map(|(f, b, s, _)| (f, b, s)).collect(), &mut model, dim, &mut tracker)?;
+        let mut files = Vec::with_capacity(group.len());
+        for (f, b, s, is_new) in group {
+            let known = if is_new { HashMap::new() } else { db::vectors_by_text(conn, &f.rel_path)? };
+            files.push((f, b, s, known));
+        }
+        let prepared = prepare_many(files, &mut model, dim, &mut tracker)?;
         for (p, is_new) in prepared.iter().zip(flags) {
             let tx = conn.transaction()?;
             write(&tx, p)?;
@@ -304,7 +321,7 @@ fn rebuild_scan(
         for f in files {
             if let Some(bytes) = read_scanned(f)? {
                 let sha = sha256_hex(&bytes);
-                group.push((f, bytes, sha));
+                group.push((f, bytes, sha, HashMap::new()));
             }
         }
         let vanished = files.len() - group.len();
@@ -643,6 +660,104 @@ mod tests {
         check(db.conn());
         rebuild(db.conn_mut(), &meta(), &vault, &ex, &src, &mut no_progress()).unwrap();
         check(db.conn());
+    }
+
+    /// Records every text passed to `embed`.
+    #[derive(Default)]
+    struct TextRecorder { texts: std::sync::Mutex<Vec<String>> }
+    impl Embedder for TextRecorder {
+        fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            self.texts.lock().unwrap().extend(texts.iter().map(|t| t.to_string()));
+            FakeEmbedder.embed(texts)
+        }
+        fn count_tokens(&self, text: &str) -> usize { FakeEmbedder.count_tokens(text) }
+    }
+
+    /// Indexes `vault`, rewrites `note` with `after`, reindexes, and returns the texts embedded by
+    /// the second run.
+    fn texts_embedded_after_rewrite(note: &str, before: &str, after: &str) -> (Vec<String>, tempfile::TempDir, Db) {
+        let (d, vault, mut db) = vault_of(&[(note.into(), before.into()), ("other.md".into(), "# Other\n\nkept\n".into())]);
+        let ex = scanner::build_exclude(&[]).unwrap();
+        let rec = Arc::new(TextRecorder::default());
+        let r = rec.clone();
+        let src = move || -> Result<Arc<dyn Embedder>> { Ok(r.clone()) };
+        reindex(db.conn_mut(), &vault, &ex, &src, &mut no_progress()).unwrap();
+        rec.texts.lock().unwrap().clear();
+        fs::write(vault.join(note), after).unwrap();
+        reindex(db.conn_mut(), &vault, &ex, &src, &mut no_progress()).unwrap();
+        let texts = rec.texts.lock().unwrap().clone();
+        (texts, d, db)
+    }
+
+    /// Every stored vector is the embedding of its own chunk's text.
+    fn assert_vectors_match_text(c: &Connection) {
+        let mut stmt = c.prepare("SELECT f.text, v.embedding FROM chunks ch JOIN chunks_fts f ON f.rowid = ch.id JOIN chunk_vectors v ON v.chunk_rowid = ch.id").unwrap();
+        let rows: Vec<(String, Vec<u8>)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(|r| r.unwrap()).collect();
+        for (text, blob) in rows {
+            assert_eq!(blob, db::f32_blob(&FakeEmbedder.embed(&[&text]).unwrap()[0]), "{text}");
+        }
+    }
+
+    #[test]
+    fn notes_changed_in_one_run_each_keep_their_reused_vectors_aligned() {
+        let doc = |t: &str, a: &str, c: &str| format!("# {t}\n\nintro {t}\n\n## A\n\n{a}\n\n## B\n\nbeta {t}\n\n## C\n\n{c}\n");
+        let (_d, vault, mut db) = vault_of(&[("x.md".into(), doc("X", "alpha", "gamma")), ("y.md".into(), doc("Y", "alpha", "gamma"))]);
+        let ex = scanner::build_exclude(&[]).unwrap();
+        let rec = Arc::new(TextRecorder::default());
+        let r = rec.clone();
+        let src = move || -> Result<Arc<dyn Embedder>> { Ok(r.clone()) };
+        reindex(db.conn_mut(), &vault, &ex, &src, &mut no_progress()).unwrap();
+        rec.texts.lock().unwrap().clear();
+        fs::write(vault.join("x.md"), doc("X", "alpha new", "gamma")).unwrap();
+        fs::write(vault.join("y.md"), doc("Y", "alpha", "gamma new")).unwrap();
+        fs::write(vault.join("z.md"), doc("Z", "alpha", "gamma")).unwrap();
+        let stats = reindex(db.conn_mut(), &vault, &ex, &src, &mut no_progress()).unwrap();
+        assert_eq!(stats, ReindexStats { added: 1, updated: 2, ..Default::default() });
+        let mut texts = rec.texts.lock().unwrap().clone();
+        texts.sort();
+        let mut expected: Vec<String> = ["X > A\n\nalpha new", "Y > C\n\ngamma new"].map(String::from).to_vec();
+        expected.extend(["Z\n\nintro Z", "Z > A\n\nalpha", "Z > B\n\nbeta Z", "Z > C\n\ngamma"].map(String::from));
+        expected.sort();
+        assert_eq!(texts, expected);
+        assert_vectors_match_text(db.conn());
+    }
+
+    #[test]
+    fn an_edited_note_embeds_only_the_sections_whose_text_changed() {
+        let before = "# Doc\n\nintro\n\n## A\n\nalpha\n\n## B\n\nbeta\n\n## C\n\ngamma\n";
+        let after = "# Doc\n\nintro\n\n## A\n\nalpha\n\n## B\n\nbeta changed\nand a new line\n\n## C\n\ngamma\n";
+        let (texts, _d, db) = texts_embedded_after_rewrite("n.md", before, after);
+        assert_eq!(texts, vec!["Doc > B\n\nbeta changed\nand a new line".to_string()]);
+        assert_vectors_match_text(db.conn());
+        let c_start: i64 = db.conn().query_row("SELECT start_line FROM chunks WHERE chunk_id = 'n.md#C'", [], |r| r.get(0)).unwrap();
+        assert_eq!(c_start, 14, "a reused chunk takes its new line numbers");
+    }
+
+    #[test]
+    fn a_moved_split_reembeds_the_shifted_parts_of_that_section_and_nothing_else() {
+        let para = |w: &str, n: usize| vec![w; n].join(" ");
+        let long = |first: usize| {
+            format!(
+                "# Doc\n\n## Long\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}\n\n## Short\n\nshort text\n",
+                para("p1", first), para("p2", 100), para("p3", 100), para("p4", 100), para("p5", 100)
+            )
+        };
+        // 100-word paragraphs pack as [p1 p2] [p3 p4] [p5]; a 160-word p1 packs as [p1] [p2 p3] [p4 p5].
+        let (texts, _d, db) = texts_embedded_after_rewrite("n.md", &long(100), &long(160));
+        assert_eq!(texts.len(), 3, "every part of the long section moved");
+        assert!(texts.iter().all(|t| t.starts_with("Doc > Long\n\n")), "{texts:?}");
+        assert_vectors_match_text(db.conn());
+    }
+
+    #[test]
+    fn a_change_to_properties_only_embeds_nothing() {
+        let before = "---\nstatus: draft\n---\n# Doc\n\nbody\n\n## A\n\nalpha\n";
+        let after = "---\nstatus: done\ntags: [x]\n---\n# Doc\n\nbody\n\n## A\n\nalpha\n";
+        let (texts, _d, db) = texts_embedded_after_rewrite("n.md", before, after);
+        assert_eq!(texts, Vec::<String>::new());
+        let tags: String = db.conn().query_row("SELECT tags_json FROM files WHERE path = 'n.md'", [], |r| r.get(0)).unwrap();
+        assert_eq!(tags, "[\"x\"]");
+        assert_vectors_match_text(db.conn());
     }
 
     #[test]

@@ -355,6 +355,23 @@ pub fn delete_file(conn: &Connection, path: &str) -> Result<()> {
     Ok(())
 }
 
+/// The stored vector of each chunk of `path`, keyed by the text it was embedded from.
+pub fn vectors_by_text(conn: &Connection, path: &str) -> Result<HashMap<String, Vec<f32>>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.text, v.embedding FROM chunks ch
+         JOIN chunks_fts f ON f.rowid = ch.id JOIN chunk_vectors v ON v.chunk_rowid = ch.id
+         WHERE ch.path = ?1",
+    )?;
+    let rows = stmt.query_map([path], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)))?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (text, blob) = row?;
+        let vector = blob.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+        out.insert(text, vector);
+    }
+    Ok(out)
+}
+
 pub fn set_mtime(conn: &Connection, path: &str, mtime_ns: i64) -> Result<()> {
     conn.execute("UPDATE files SET mtime_ns = ?1 WHERE path = ?2", params![mtime_ns, path])?;
     Ok(())
