@@ -2,25 +2,38 @@
 
 > **Semantic search over your Obsidian vault, for your AI agent and for you.**
 
-vlt turns a vault (a folder of markdown notes) into a knowledge base your AI agent can search. It indexes your notes locally and serves them through **MCP for agents** and the **`vlt` CLI for humans**: the agent finds the right sections of your notes, answers from them, and, when you ask, adds properties and links to them and writes the new notes you approve.
+vlt turns a vault (a folder of markdown notes) into a knowledge base your AI agent can search. It indexes your notes locally and serves them through **MCP for agents** and the **`vlt` CLI for humans**.
 
 Everything runs on your machine: no daemon, no cloud, no API keys.
 
-## Why?
+## What it does
 
-Your notes hold what no model knows: your projects, your past decisions, your conventions. But an agent can't use them well:
+- **Answers from your notes.** Ask your agent "what do I know about X?" and it searches your vault, reads what it needs and cites the notes it used.
+- **Enriches your notes.** Ask it to "process the note X" and it proposes properties, links to and from related notes, and fixes for broken links. It applies only the ones you pick.
+- **Drafts new notes** that follow your vault's conventions, and writes them once you approve.
+- **Audits the vault**: inconsistent properties, broken links, orphan notes.
+- **Moves, renames and deletes notes**, rewriting the links a move would break. Deleted notes go to `.trash/` in the vault.
 
-- **It doesn't know they exist.** Unless you paste a note into the chat, the agent answers from general knowledge.
-- **grep is not search.** "How do we handle retries?" won't match a note titled *Backoff policy*. The agent reads file after file, or misses the answer.
-- **Notes rot.** Properties are inconsistent, related notes aren't linked, links break when notes move.
+## Why vlt
 
-vlt fixes all three:
+Your notes hold what no model knows: your projects, your past decisions, your conventions. But an agent can't use them well: it doesn't know they exist, grep won't match "how do we handle retries?" to a note titled *Backoff policy*, and notes drift as they grow.
+
+- **Finds by meaning, not just words**: keyword and semantic search combined, then reranked by relevance.
+- **"Nothing relevant" is an answer**: weak matches are dropped instead of returning random hits.
+- **Filters**: by property (`status=in_progress`, `tags=rust`, `date>=2026-01-01`) and by folder.
+- **You stay in control**: the agent changes your notes only when you approve, and never overwrites or erases one.
+- **Local and private**: models run on your CPU and work offline after the first download.
+- **No maintenance**: the index keeps itself up to date.
+
+## How it works
 
 ```mermaid
 flowchart LR
     Q(["what did we decide<br/>about retries?"]) --> F["filters<br/>property · folder"]
     F --> B["BM25<br/>keywords"]
     F --> V["vectors<br/>meaning"]
+    vault[/"your vault<br/>markdown notes"/] -. "indexed in ~/.vlt/" .-> B
+    vault -. "indexed in ~/.vlt/" .-> V
     B --> R["fused<br/>RRF"]
     V --> R
     R --> X["reranked<br/>cross-encoder"]
@@ -29,317 +42,112 @@ flowchart LR
     T -- no --> D["dropped"]
 ```
 
-- **Hybrid search**: keyword search (SQLite FTS5) and semantic search (sqlite-vec) over the sections of every note, the best of each fused with Reciprocal Rank Fusion and reranked by a local cross-encoder. Results below a relevance threshold are dropped, so "nothing relevant" is an answer, not five random hits.
-- **Filters**: by frontmatter property (`status=in_progress`, `tags=rust`, `date>=2026-01-01`) and by folder. A tag also matches its nested tags: `tags=project` finds `project/vlt`. `tags` covers the frontmatter and `#tags` written in the body, as in Obsidian. `tags=#rust` and `tags=rust` are the same filter.
-- **Enrichment on request**: ask the agent to "process the note X" and it proposes properties that match your vault's vocabulary, links from and to related notes, and fixes for broken links. It writes only the changes you pick. It can also move, rename or delete a note when you ask: links that the move would break are rewritten, and a deleted note goes to `.trash/` in the vault.
-- **Local models**: embeddings and reranking run on your CPU with [Candle](https://github.com/huggingface/candle). Pick any Hugging Face model of a [supported architecture](#models). Models are downloaded once, checked against the hashes Hugging Face publishes, and locked to that commit; vlt works offline afterwards.
+A search combines keywords and meaning, reranks the candidates by relevance and keeps only the ones that clear a threshold.
 
-## Quick start
+vlt indexes the sections of every note and keeps that index in `~/.vlt/`, together with its config and models. Each call picks up the notes you added, changed or deleted, so you never reindex by hand.
 
-### 1. Install the binary
+Your agent talks to vlt through MCP; a Skill installed alongside teaches it when to search your notes and how to propose changes. Your vault stays as it is: vlt adds nothing to it except a `.trash/` folder, and the `vlt` CLI never writes to it.
+
+## Install
+
+Requirements: macOS or Linux (x86_64 or aarch64), about 1.5 GB of disk for the models, and optionally an MCP agent: Claude Code, opencode or Codex.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/andresdigiovanni/vlt/main/install.sh | bash
 ```
 
-The script downloads the prebuilt binary for your platform (macOS or Linux, x86_64 or aarch64) from GitHub Releases, verifies its SHA256 checksum, installs it to `~/.local/bin/vlt` and runs `vlt install` to set it up. Make sure `~/.local/bin` is on your `PATH`.
+The script installs the binary to `~/.local/bin/vlt` (make sure it is on your `PATH`) and runs `vlt install`, which:
 
-### 2. Set it up
-
-The script starts `vlt install` for you. Without a terminal to ask on (in CI, for example), it prints the command instead; run it yourself:
-
-```bash
-vlt install
-```
-
-`vlt install`:
-
-1. asks for the path of your vault (and offers to create it if it does not exist),
-2. downloads the embedding and reranking models to `~/.vlt/models/` (~1.5 GB),
-3. registers the MCP server and installs the vlt Skill for each agent you pick (Claude Code, opencode, Codex),
-4. writes `~/.vlt/config.toml` with default values,
+1. asks for the path of your vault,
+2. downloads the models,
+3. connects vlt to the agents you pick,
+4. writes `~/.vlt/config.toml`,
 5. indexes the vault.
 
-Restart your agent session afterwards.
+Restart your agent session afterwards. If the script can't ask (in CI, for example), run `vlt install` yourself.
 
-### 3. Ask your agent
-
-```text
-What do I know about SQLite concurrency?
-Which of my projects are in progress?
-Process the note projects/vlt_design.md
-```
-
-The Skill teaches the agent when to search your notes and how to enrich them. You can also search from the terminal:
+Non-interactive setup:
 
 ```bash
-vlt search "sqlite concurrency"
+vlt install --vault ~/notes --target claude --yes   # --target claude|opencode|codex, repeatable; --all for every agent
 ```
 
-## Install
+To register vlt with another MCP client by hand, the server command is `vlt mcp` (stdio).
 
-### Non-interactive
-
-```bash
-vlt install --vault ~/notes --target claude --yes
-```
-
-`--target` is repeatable; `--all` configures every supported agent; `--yes` answers yes to every confirmation.
-
-| Agent | `--target` | MCP server registered in | Skill installed in |
-|---|---|---|---|
-| Claude Code | `claude` | `~/.claude.json` | `~/.claude/skills/vlt/` |
-| opencode | `opencode` | `~/.config/opencode/opencode.json` (or `.jsonc`; `$XDG_CONFIG_HOME` is honoured) | `~/.config/opencode/skills/vlt/` |
-| Codex | `codex` | `~/.codex/config.toml` | `~/.codex/skills/vlt/` |
-
-Installation configures two things per agent:
-
-1. **MCP server**: gives the agent the vlt tools.
-2. **Skill**: teaches the agent when to search your notes, how to filter, and how to propose changes.
-
-If your opencode config has comments, vlt does not rewrite it: it prints the `mcp.vlt` block for you to add by hand and carries on with the rest. vlt does not change your agent's permissions: the agent asks the first time it uses each tool.
-
-Running `vlt install` again is safe: it keeps your `config.toml` (updating only the vault if you pick a different one) and skips models already downloaded.
-
-### A specific version
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/andresdigiovanni/vlt/main/install.sh | bash -s -- --version vX.Y.Z
-```
+To install a specific version, append `-s -- --version vX.Y.Z` to `bash` in the install command.
 
 ### Upgrade
 
-Run the install script again. It replaces the binary in `~/.local/bin`, then reruns `vlt install --yes` for each agent that has the vlt Skill, so the Skill and the MCP server entry match the new version, without asking. Your config, index and models are kept; models are downloaded only if the new version's defaults changed.
+Run the install script again. It replaces the binary and refreshes the setup of your agents; your config, index and models are kept.
 
-If you upgrade the binary some other way, run `vlt install` afterwards to update the Skill: it is embedded in the binary.
+### Uninstall
 
-### Manual MCP configuration
-
-If you prefer to register the MCP server yourself, the command is `vlt mcp` (stdio). `vlt install` writes the absolute path of the binary; use it if `vlt` is not on the `PATH` your agent sees.
-
-Claude Code (`~/.claude.json`):
-
-```json
-{
-  "mcpServers": {
-    "vlt": { "type": "stdio", "command": "vlt", "args": ["mcp"] }
-  }
-}
+```bash
+vlt uninstall
+rm ~/.local/bin/vlt
 ```
 
-opencode:
-
-```json
-{
-  "mcp": {
-    "vlt": { "type": "local", "command": ["vlt", "mcp"], "enabled": true }
-  }
-}
-```
-
-Codex (`~/.codex/config.toml`):
-
-```toml
-[mcp_servers.vlt]
-command = "vlt"
-args = ["mcp"]
-```
-
-Without `vlt install` you also need `~/.vlt/config.toml` (see [Configuration](#configuration)) and `vlt reindex`, which downloads the models and builds the index.
+`vlt uninstall` disconnects vlt from every agent and asks whether to delete `~/.vlt/`. It never touches your vault.
 
 ## Usage
 
 ### With your agent
 
-The agent uses vlt in four flows:
+Just ask:
 
-- **Answering.** When you ask what you know or wrote about something, or when the task depends on your notes (one of your projects, a past decision, a convention), the agent searches the vault, reads what it needs and cites the sections it used (`projects/mcp_rust.md#Concurrency`).
-- **Enriching.** When you ask it to process a note, add properties to it or link it, the agent proposes one numbered list: properties, links from the note, links to it from other notes, and repairs for broken links. You pick ("apply 1, 3"), and it writes only those.
-- **Drafting.** When you ask it to write something up as a new note, the agent first searches for a note that already covers it, then drafts the note with the properties and file name its folder uses and links in the prose. Once you approve the draft, the agent writes it with `create`, which never overwrites a note, and offers to link other notes to it.
-- **Auditing.** When you ask it to audit the vault or a folder, the agent runs `audit` and proposes one numbered list of fixes across notes: one spelling per value and key, the keys and tags a folder's notes share, and repairs for broken links; notes nobody links are offered for processing. It applies only the ones you pick.
-
-```mermaid
-sequenceDiagram
-    actor You
-    participant Agent
-    participant vlt
-    You->>Agent: Process the note projects/vlt_design.md
-    Agent->>vlt: get · properties · related · search
-    vlt-->>Agent: the note, the vault's vocabulary, related notes
-    Agent->>You: numbered list: properties, links, repairs
-    You->>Agent: apply 1, 3
-    Agent->>vlt: update_properties · edit (items 1 and 3 only)
-    vlt-->>Agent: diff, note reindexed
-    Agent->>You: what was applied
+```text
+What do I know about SQLite concurrency?
+Which of my projects are in progress?
+Process the note projects/vlt_design.md
+Write up what we decided today as a new note
+Audit the projects folder
 ```
+
+When the agent proposes changes, it gives you a numbered list; reply with the ones to apply ("apply 1, 3").
 
 ### From the terminal
 
 ```bash
 vlt search "retry policy"
-vlt search "retry policy" --where tags=backend --where "date>=2026-01-01" --path-prefix projects/
+vlt search "retry policy" --where tags=backend --path-prefix projects/
 vlt get projects/api.md
 vlt properties
+vlt audit
 ```
 
-### Keeping the index fresh
-
-You don't need to reindex by hand. Every `search`, `get`, `properties`, `folders`, `related` and `audit` call picks up the notes you added, changed or deleted since the last one, and every write by the agent reindexes the note it changed. `vlt reindex` exists for a full rebuild (`--force`) or to warm the index ahead of time.
-
-## CLI reference
-
-```
-vlt install [--vault <path>] [--target claude|opencode|codex]... [--all] [--yes]
-vlt uninstall [--yes]
-vlt mcp
-vlt search <query> [--where <expr>]... [--path-prefix <p>] [--limit <n>] [--json]
-vlt get <path> [--json]
-vlt properties [--where <expr>]... [--path-prefix <p>] [--json]
-vlt folders [--path-prefix <p>] [--json]
-vlt related <path> [--limit <n>] [--json]
-vlt audit [--path-prefix <p>] [--json]
-vlt reindex [--force]
-```
-
-| Command | What it does |
-|---|---|
-| `install` | Sets up vlt: vault, models, MCP server and Skill for each selected agent, first index. |
-| `uninstall` | Removes the MCP server and the Skill from every agent. Asks before deleting `~/.vlt/`; with `--yes` it keeps `~/.vlt/`. |
-| `mcp` | Runs the MCP server on stdio (the agent starts it). |
-| `search` | Hybrid search. `--where` filters by property (repeatable), `--path-prefix` restricts to a folder, `--limit` overrides the configured value. |
-| `get` | Shows a document (path relative to the vault): its title, path, properties and content. `--json` adds its sections, outgoing links and backlinks. |
-| `properties` | Lists the frontmatter properties with their inferred type, the number of documents using them and their most frequent values; `--key` shows one property with every value; `tags` also counts body `#tags`. `--where` counts only the notes it selects, with the syntax of `search`. Spelling variants of a value are listed under its key. |
-| `folders` | Lists the folders with the notes directly in each, the total with subfolders and the 5 most used keys; the root is `/`. |
-| `related` | Shows the notes closest to a note (with the matching sections and existing links), the tags two or more of them share, and the sections of other notes that name it without a link. |
-| `audit` | Reports spelling variants, rare keys, folder gaps, broken links, orphans and notes linking nowhere, each section capped at 50 lines with its total. |
-| `reindex` | Incremental reindex; `--force` rebuilds the index from scratch. Downloads the configured models first if they are missing. |
-
-`--json` prints the same payload the MCP tool returns.
-
-`--where` takes `<key><op><value>` with `op` one of `=`, `>`, `>=`, `<`, `<=`. On a list property, `=` means "contains".
-
-Errors are printed to stderr as `error: <message>` with exit code 1.
-
-## MCP tools
-
-The server is named `vlt`. It exposes twelve tools:
-
-| Tool | Purpose |
-|---|---|
-| `search` | Hybrid search with property filters, reranking and a score threshold. Parameters: `query`, `where`, `path_prefix`, `limit`, `min_score`. |
-| `get` | Full document (`path`) with properties, tags (frontmatter and body), sections, outgoing links (an ambiguous one with its `candidates`, one in a property with its `property` key) and backlinks. |
-| `properties` | Inventory of the vault's properties (optional `where`, as in `search`, and `path_prefix`; optional `key` for one property with every value; each key's `variants`, spellings of one value that differ only in case or separators). |
-| `folders` | The vault's folders with their notes (directly in each, and with subfolders) and their 5 most used keys (optional `path_prefix`). |
-| `related` | Notes related to a note (`path`, optional `limit`): the closest notes with the sections that match and the links that exist, the tags they share, and sections that name the note without a link. |
-| `audit` | Health report (optional `path_prefix`): spelling variants of values and keys, keys one note has, keys and tags most of a folder has with the notes missing them, broken links, notes nobody links and notes linking nowhere; each section with its `total` and at most 50 items. |
-| `reindex` | Detects changes in the vault and reindexes them incrementally. |
-| `edit` | Replaces one exact fragment of a document's body. Parameters: `path`, `old_text`, `new_text`. |
-| `update_properties` | Adds, changes or removes frontmatter properties of a document, keeping the rest of the file as it is. Parameters: `path`, `set`, `unset`. |
-| `create` | Writes a new note (`path`, `content`: the whole file), creating missing folders. Never overwrites: an existing path is `already_exists`; excluded paths are rejected. |
-| `move` | Moves or renames a note (`path`, `new_path`), creating missing folders, and rewrites the links the move would break (backlinks, the note's own relative links, names it makes ambiguous) in the style each was written; `updated` lists each rewritten note with its diff. Never overwrites: an existing path is `already_exists`; a name with `#`, `|`, `[`, `]` or `^` is rejected (`invalid_arguments`). |
-| `delete` | Moves a note (`path`) to `.trash/` in the vault (`trashed_to`), or removes an empty folder. `broken_links` lists the links to the note that now point nowhere. |
-
-### What vlt writes
-
-`edit`, `update_properties`, `create`, `move` and `delete` are the only tools that write to the vault: `edit` and `update_properties` change existing `.md` files inside it, `create` writes new ones, never over an existing file, `move` moves or renames a note (to another folder too) and rewrites the links it would break, and `delete` moves a note to `.trash/` in the vault (it is never erased) and removes only empty folders. The agent calls them for the changes, drafts, moves and deletions you approve. The `vlt` CLI never writes to your notes.
+`vlt --help` lists every command; add `--json` for machine-readable output.
 
 ## Configuration
 
-`~/.vlt/config.toml`, written by `vlt install`. Unknown keys are rejected; missing keys take their defaults.
+`~/.vlt/config.toml`, written by `vlt install`. The keys you are most likely to change:
 
 ```toml
 vault = "/path/to/vault"
-
-# Paths relative to the vault that are not indexed (glob syntax; `**` crosses subdirectories).
-# Example: exclude = ["templates/**", "archive/old/**"]
-exclude = []
+exclude = ["templates/**"]   # paths not indexed
 
 [models]
-embedding = "Qwen/Qwen3-Embedding-0.6B"             # 1024 dimensions, ~1.2 GB
-reranker  = "mixedbread-ai/mxbai-rerank-base-v1"    # ~350 MB
-idle_unload_secs = 300                               # unload the models after 5 min without use
-
-# Optional overrides of what the model repos declare:
-# [models.embedding_options]
-# revision = "main"              # branch, tag or commit to download
-# pooling = "cls"                # cls, mean or last
-# query_prefix = "query: "       # prepended to search queries
-# document_prefix = "passage: "  # prepended to indexed text
-# precision = "f32"              # f32 or f16 (default: f16 for 16-bit weights, else f32)
-# [models.reranker_options]
-# revision = "main"
-# precision = "f32"
+embedding = "Qwen/Qwen3-Embedding-0.6B"
+reranker  = "mixedbread-ai/mxbai-rerank-base-v1"
 
 [search]
-k = 50            # candidates per branch (BM25 and vectors)
-rrf_k = 60        # Reciprocal Rank Fusion constant
-rerank_top = 10   # candidates passed to the reranker; each one costs reranking time
-limit = 5         # results returned by default
-min_score = 0.02  # reranker threshold [0, 1]; depends on the reranker, calibrate with real documents
+limit = 5          # results returned by default
+min_score = 0.02   # relevance threshold
 ```
 
-Changing `exclude` does not require a rebuild: the next incremental reindex drops the newly excluded paths and indexes the ones that are no longer excluded.
-
-Changing `vault` or a model makes the existing index unusable: searches then fail with a message asking for a rebuild. Run `vlt reindex` to rebuild it (it takes a while on a large vault).
-
-The default embedding model is multilingual; the default reranker was trained on English, so notes in other languages are found but ranked less precisely.
+After changing `vault` or a model, run `vlt reindex` to rebuild the index.
 
 ### Models
 
-`embedding` and `reranker` take any Hugging Face repo id (`<owner>/<name>`) whose architecture vlt can run:
+Any Hugging Face embedding model or cross-encoder reranker based on BERT, XLM-RoBERTa, Qwen3 (embedding) or DeBERTa-v2 (reranker) works. The defaults favour quality and need about 2.3 GB of memory; for a lighter, faster setup on English notes:
 
-| Role | Architectures (`model_type` in the repo's `config.json`) | Examples |
-|---|---|---|
-| `embedding` | `bert`, `xlm-roberta`, `qwen3` | `BAAI/bge-small-en-v1.5`, `BAAI/bge-large-en-v1.5`, `Qwen/Qwen3-Embedding-0.6B` |
-| `reranker` | `bert`, `xlm-roberta`, `deberta-v2` cross-encoders with one output (`*ForSequenceClassification`) | `cross-encoder/ms-marco-MiniLM-L-6-v2`, `BAAI/bge-reranker-base`, `mixedbread-ai/mxbai-rerank-base-v1`, `mixedbread-ai/mxbai-rerank-large-v1` |
-
-The repo must ship `config.json`, `tokenizer.json` and safetensors weights (`model.safetensors`, or shards listed in `model.safetensors.index.json`). vlt reads everything else from the repo's sentence-transformers files: the pooling (`1_Pooling/config.json`), the query and document prompts (`config_sentence_transformers.json`) and the maximum length (`sentence_bert_config.json`, capped at 512 tokens). Set a key under `[models.embedding_options]` when the repo does not declare it or you want another value. A repo without pooling settings gets mean pooling (last-token for `qwen3`); the English BGE models get their documented query instruction.
-
-Models compute in the precision their weights are stored in: 16-bit weights (F16, or BF16, which Candle cannot multiply on a CPU and so runs as F16) use half the memory of F32 and run faster on CPUs with native F16. `deberta-v2` rerankers always run in F32, since Candle's implementation builds F32 masks. Set `precision = "f32"` to trade memory for the exact F32 result.
-
-`vlt reindex` (and `vlt install`) downloads a model the first time it is configured, at the revision set in the options (`main` by default). vlt checks each file against the hash Hugging Face publishes for that commit and records the commit and hashes in `vlt-lock.json` in the model's folder. From then on the model stays at that commit, even if the repo changes; set another `revision` to move it. An unsupported model is reported right after its download, with the reason. Private and gated repos are not supported.
-
-Model size sets speed and memory on a CPU, and the reranker dominates both: it reads every candidate in full. Measured on an Apple M-series CPU, reranking 10 chunks of 256 tokens (the default `rerank_top` and chunk size) takes about 4.3 s with `mixedbread-ai/mxbai-rerank-base-v1` (the default), 12.6 s with `mixedbread-ai/mxbai-rerank-large-v1`, 1.8 s with `mixedbread-ai/mxbai-rerank-xsmall-v1` and 0.6 s with `cross-encoder/ms-marco-MiniLM-L-6-v2`; time grows in proportion to `rerank_top` and to chunk length. With the defaults vlt peaks at about 2.3 GB of memory; `BAAI/bge-small-en-v1.5` with `cross-encoder/ms-marco-MiniLM-L-6-v2` (the defaults of vlt 0.1.0) need about 350 MB.
-
-## Where everything lives
-
-```mermaid
-flowchart LR
-    agent["AI agent<br/>Claude Code · opencode · Codex"] -- "MCP (stdio)" --> vlt
-    you["you"] -- "vlt CLI" --> vlt
-    subgraph home["~/.vlt/"]
-        config["config.toml"]
-        index[("index<br/>SQLite: FTS5 + sqlite-vec")]
-        models["models<br/>embedding + reranker"]
-    end
-    vlt --- config
-    vlt --- index
-    vlt --- models
-    vlt -- "reads changed notes" --> vault[/"your vault<br/>markdown notes"/]
-    vlt -. "create · edit · update_properties · move · delete<br/>only what you approve" .-> vault
+```toml
+[models]
+embedding = "BAAI/bge-small-en-v1.5"
+reranker  = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 ```
 
-```text
-~/.vlt/
-├── config.toml   # configuration
-├── index/        # SQLite database: sections, FTS5 index, vectors, links
-└── models/       # embedding and reranking models
-```
+Models are downloaded once and pinned to that version.
 
-Your vault stays as it is: vlt keeps nothing inside it except the `.trash/` folder that `delete` moves notes to, and only writes there through `create`, `edit`, `update_properties`, `move` and `delete`, when you approve a change.
+## Development
 
-## Uninstall
-
-```bash
-vlt uninstall
-```
-
-This removes the MCP server and the Skill from every agent and asks whether to delete `~/.vlt/` (config, index and models). With `--yes`, `~/.vlt/` is kept.
-
-Uninstalling never touches your vault: if it lives inside `~/.vlt/`, or if `config.toml` cannot be read so vlt cannot tell where it is, `~/.vlt/` is kept and vlt says so.
-
-Finally, remove the binary:
-
-```bash
-rm ~/.local/bin/vlt
-```
+Requires Rust 1.85+. `make help` lists the tasks (`make check` before merging); see [`AGENTS.md`](AGENTS.md) and [`CHANGELOG.md`](CHANGELOG.md).
