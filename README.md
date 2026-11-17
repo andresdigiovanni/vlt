@@ -50,7 +50,7 @@ Your agent talks to vlt through MCP; a Skill installed alongside teaches it when
 
 ## Install
 
-Requirements: macOS or Linux (x86_64 or aarch64), about 1.5 GB of disk for the models, and optionally an MCP agent: Claude Code, opencode or Codex.
+Requirements: macOS or Linux (x86_64 or aarch64), about 1.5 GB of disk for the models, and optionally an MCP agent: Claude Code, opencode, Codex or pi.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/andresdigiovanni/vlt/main/install.sh | bash
@@ -69,7 +69,7 @@ Restart your agent session afterwards. If the script can't ask (in CI, for examp
 Non-interactive setup:
 
 ```bash
-vlt install --vault ~/notes --target claude --yes   # --target claude|opencode|codex, repeatable; --all for every agent
+vlt install --vault ~/notes --target claude --yes   # --target claude|opencode|codex|pi, repeatable; --all for every agent
 ```
 
 To register vlt with another MCP client by hand, the server command is `vlt mcp` (stdio).

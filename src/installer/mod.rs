@@ -14,8 +14,8 @@ use crate::ml::models::Models;
 use crate::paths;
 use crate::{Result, VltError};
 use agentsetup::{
-    claude_json, codex_file, configure_claude, configure_codex, configure_opencode, deconfigure_claude, deconfigure_codex,
-    deconfigure_opencode, opencode_dir, opencode_file, SetupAction,
+    claude_json, codex_file, configure_claude, configure_codex, configure_opencode, configure_pi, deconfigure_claude,
+    deconfigure_codex, deconfigure_opencode, deconfigure_pi, opencode_dir, opencode_file, pi_file, SetupAction,
 };
 use models::{missing, pull_showing_progress};
 use skill::{install_skill, uninstall_skill};
@@ -25,6 +25,7 @@ pub enum Target {
     Claude,
     Opencode,
     Codex,
+    Pi,
 }
 
 pub struct InstallOptions {
@@ -129,6 +130,7 @@ fn mcp_config_path(target: Target, home: &Path) -> PathBuf {
         Target::Claude => claude_json(home),
         Target::Opencode => opencode_file(&opencode_dir(home)),
         Target::Codex => codex_file(home),
+        Target::Pi => pi_file(home),
     }
 }
 
@@ -145,6 +147,7 @@ fn configure_target(target: Target, home: &Path, exe: &Path) -> Result<()> {
         Target::Claude => configure_claude(home, exe)?,
         Target::Opencode => configure_opencode(&opencode_dir(home), exe)?,
         Target::Codex => configure_codex(home, exe)?,
+        Target::Pi => configure_pi(home, exe)?,
     };
     let config = shown(&mcp_config_path(target, home), home);
     match action {
@@ -264,6 +267,7 @@ pub fn uninstall(yes: bool) -> Result<()> {
             Target::Claude => deconfigure_claude(&home)?,
             Target::Opencode => deconfigure_opencode(&opencode_dir(&home))?,
             Target::Codex => deconfigure_codex(&home)?,
+            Target::Pi => deconfigure_pi(&home)?,
         };
         let config = shown(&mcp_config_path(target, &home), &home);
         match action {

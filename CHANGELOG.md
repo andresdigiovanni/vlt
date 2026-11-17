@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- pi joins Claude Code, opencode and Codex as an install target: `vlt install --target pi` registers the MCP server in the pi agent directory's `mcp.json` (`~/.pi/agent/`, overridable with `PI_CODING_AGENT_DIR`) and installs the Skill at `~/.pi/agent/skills/vlt/`. `vlt uninstall` removes both; `install.sh` refreshes them on an upgrade.
+
 ## [0.5.0] - 2026-11-05
 
 ### Changed

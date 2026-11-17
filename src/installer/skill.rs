@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use super::agentsetup::opencode_dir;
+use super::agentsetup::{opencode_dir, pi_dir_from};
 use super::Target;
 use crate::Result;
 
@@ -12,6 +12,7 @@ pub fn skill_path(home: &Path, target: Target) -> PathBuf {
         Target::Claude => home.join(".claude/skills/vlt/SKILL.md"),
         Target::Opencode => opencode_dir(home).join("skills/vlt/SKILL.md"),
         Target::Codex => home.join(".codex/skills/vlt/SKILL.md"),
+        Target::Pi => pi_dir_from(std::env::var_os("PI_CODING_AGENT_DIR"), home).join("skills/vlt/SKILL.md"),
     }
 }
 
@@ -50,6 +51,14 @@ mod tests {
         assert!(uninstall_skill(d.path(), Target::Claude).unwrap());
         assert!(!d.path().join(".claude/skills/vlt").exists());
         assert!(!uninstall_skill(d.path(), Target::Claude).unwrap());
+
+        let p = install_skill(d.path(), Target::Pi).unwrap();
+        assert_eq!(p, skill_path(d.path(), Target::Pi));
+        assert!(p.starts_with(d.path()) || std::env::var_os("PI_CODING_AGENT_DIR").is_some(),
+            "the pi Skill lands under the temp home unless the env redirects the agent dir");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), SKILL_MD);
+        assert!(uninstall_skill(d.path(), Target::Pi).unwrap());
+        assert!(!skill_path(d.path(), Target::Pi).parent().unwrap().exists());
     }
 
     #[test]

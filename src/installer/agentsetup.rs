@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
@@ -274,11 +275,159 @@ pub fn deconfigure_codex(home: &Path) -> Result<SetupAction> {
     Ok(SetupAction::Removed)
 }
 
+/// The pi agent directory: `$PI_CODING_AGENT_DIR`, else `~/.pi/agent`.
+pub fn pi_dir(home: &Path) -> PathBuf {
+    pi_dir_from(std::env::var_os("PI_CODING_AGENT_DIR"), home)
+}
+
+/// `pi_dir` with the override injected, so callers can resolve it without touching the process env.
+pub fn pi_dir_from(env: Option<OsString>, home: &Path) -> PathBuf {
+    env.filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".pi/agent"))
+}
+
+pub fn pi_file(home: &Path) -> PathBuf {
+    pi_file_from(std::env::var_os("PI_CODING_AGENT_DIR"), home)
+}
+
+/// `pi_file` with the override injected, matching `pi_dir_from`.
+pub fn pi_file_from(env: Option<OsString>, home: &Path) -> PathBuf {
+    pi_dir_from(env, home).join("mcp.json")
+}
+
+fn pi_entry(exe: &Path) -> Value {
+    json!({ "type": "stdio", "command": exe.display().to_string(), "args": ["mcp"] })
+}
+
+/// Registers `mcpServers.vlt` in the pi agent directory's `mcp.json`, preserving every other key.
+pub fn configure_pi(home: &Path, exe: &Path) -> Result<SetupAction> {
+    configure_pi_from(std::env::var_os("PI_CODING_AGENT_DIR"), home, exe)
+}
+
+/// `configure_pi` with the agent-dir override injected, so tests never touch the process env.
+pub fn configure_pi_from(env: Option<OsString>, home: &Path, exe: &Path) -> Result<SetupAction> {
+    let path = pi_file_from(env, home);
+    let mut root = read_root(&path)?.unwrap_or_default();
+    let entry = pi_entry(exe);
+    let servers = servers_of(&path, &mut root, "mcpServers")?;
+    let action = match servers.get(SERVER) {
+        Some(found) if *found == entry => return Ok(SetupAction::Unchanged),
+        Some(_) => SetupAction::Updated,
+        None => SetupAction::Added,
+    };
+    servers.insert(SERVER.into(), entry);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    write_atomic(&path, root)?;
+    Ok(action)
+}
+
+/// Removes `mcpServers.vlt` from the pi agent directory's `mcp.json`, preserving every other key.
+pub fn deconfigure_pi(home: &Path) -> Result<SetupAction> {
+    deconfigure_pi_from(std::env::var_os("PI_CODING_AGENT_DIR"), home)
+}
+
+/// `deconfigure_pi` with the agent-dir override injected, so tests never touch the process env.
+pub fn deconfigure_pi_from(env: Option<OsString>, home: &Path) -> Result<SetupAction> {
+    let path = pi_file_from(env, home);
+    let Some(mut root) = read_root(&path)? else {
+        return Ok(SetupAction::NotPresent);
+    };
+    let removed = match root.get_mut("mcpServers").and_then(Value::as_object_mut) {
+        Some(servers) => servers.remove(SERVER).is_some(),
+        None => false,
+    };
+    if !removed {
+        return Ok(SetupAction::NotPresent);
+    }
+    write_atomic(&path, root)?;
+    Ok(SetupAction::Removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
     fn read(h: &Path) -> serde_json::Value { serde_json::from_str(&std::fs::read_to_string(h.join(".claude.json")).unwrap()).unwrap() }
+    fn pi_read(h: &Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(h.join(".pi/agent/mcp.json")).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn pi_uses_the_agent_dir_env_var_over_the_home_default() {
+        assert_eq!(
+            pi_dir_from(Some(PathBuf::from("/custom").into_os_string()), Path::new("/home/x")),
+            PathBuf::from("/custom")
+        );
+        assert_eq!(pi_dir_from(Some("".into()), Path::new("/home/x")), Path::new("/home/x").join(".pi/agent"));
+        assert_eq!(pi_dir_from(None, Path::new("/home/x")), Path::new("/home/x").join(".pi/agent"));
+    }
+
+    #[test]
+    fn pi_creates_the_config_and_is_idempotent() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(configure_pi_from(None, d.path(), Path::new("/bin/vlt")).unwrap(), SetupAction::Added);
+        assert_eq!(
+            pi_read(d.path())["mcpServers"]["vlt"],
+            json!({"type": "stdio", "command": "/bin/vlt", "args": ["mcp"]})
+        );
+        assert_eq!(configure_pi_from(None, d.path(), Path::new("/bin/vlt")).unwrap(), SetupAction::Unchanged);
+        assert_eq!(configure_pi_from(None, d.path(), Path::new("/new/vlt")).unwrap(), SetupAction::Updated);
+        assert_eq!(pi_read(d.path())["mcpServers"]["vlt"]["command"], "/new/vlt");
+        // The override wins over the home default.
+        let custom = d.path().join("custom");
+        assert_eq!(configure_pi_from(Some(custom.clone().into_os_string()), d.path(), Path::new("/bin/vlt")).unwrap(), SetupAction::Added);
+        let written = std::fs::read_to_string(custom.join("mcp.json")).unwrap();
+        let v: Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(v["mcpServers"]["vlt"]["command"], "/bin/vlt");
+    }
+
+    #[test]
+    fn pi_keeps_other_keys_and_removes_only_vlt() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join(".pi/agent");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("mcp.json"), r#"{"mcpServers":{"other":{"command":"x"}},"theme":"dark"}"#).unwrap();
+        assert_eq!(configure_pi_from(None, d.path(), Path::new("/bin/vlt")).unwrap(), SetupAction::Added);
+        let v = pi_read(d.path());
+        assert_eq!((v["theme"].clone(), v["mcpServers"]["other"]["command"].clone()), (json!("dark"), json!("x")));
+        assert_eq!(deconfigure_pi_from(None, d.path()).unwrap(), SetupAction::Removed);
+        let v = pi_read(d.path());
+        assert!(v["mcpServers"].get("vlt").is_none());
+        assert_eq!(v["mcpServers"]["other"]["command"], "x");
+        assert_eq!(deconfigure_pi_from(None, d.path()).unwrap(), SetupAction::NotPresent);
+    }
+
+    #[test]
+    fn pi_deconfigure_without_a_config_creates_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(deconfigure_pi_from(None, d.path()).unwrap(), SetupAction::NotPresent);
+        assert!(!d.path().join(".pi").exists());
+    }
+
+    #[test]
+    fn pi_invalid_json_is_an_error_and_left_untouched() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join(".pi/agent");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("mcp.json");
+        // Not JSON at all: both functions error and leave the file as it is.
+        for original in ["not json", "[1,2]"] {
+            std::fs::write(&p, original).unwrap();
+            assert!(configure_pi_from(None, d.path(), Path::new("/bin/vlt")).is_err(), "{original}");
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), original);
+            assert!(deconfigure_pi_from(None, d.path()).is_err(), "{original}");
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), original);
+        }
+        // Valid JSON but a non-object `mcpServers`: configure errors; deconfigure can only
+        // report not-present (as deconfigure_claude does) and must not create the key.
+        std::fs::write(&p, "{\"mcpServers\": 3}").unwrap();
+        assert!(configure_pi_from(None, d.path(), Path::new("/bin/vlt")).is_err());
+        assert_eq!(deconfigure_pi_from(None, d.path()).unwrap(), SetupAction::NotPresent);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "{\"mcpServers\": 3}");
+    }
 
     #[test]
     fn configure_is_idempotent_and_preserves_other_keys() {

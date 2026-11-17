@@ -4,7 +4,7 @@ use std::fs;
 
 fn cmd(home: &std::path::Path) -> Command {
     let mut c = Command::cargo_bin("vlt").unwrap();
-    c.env("HOME", home).env("VLT_HOME", home.join(".vlt")).env("VLT_FAKE_MODELS", "1").env_remove("XDG_CONFIG_HOME");
+    c.env("HOME", home).env("VLT_HOME", home.join(".vlt")).env("VLT_FAKE_MODELS", "1").env_remove("XDG_CONFIG_HOME").env_remove("PI_CODING_AGENT_DIR");
     c
 }
 
@@ -229,7 +229,7 @@ fn json_of(path: &std::path::Path) -> serde_json::Value {
 }
 
 #[test]
-fn all_installs_and_uninstalls_claude_opencode_and_codex() {
+fn all_installs_and_uninstalls_claude_opencode_codex_and_pi() {
     let d = tempfile::tempdir().unwrap();
     let home = d.path();
     let out = install(home, &["--vault", home.join("v").to_str().unwrap(), "--all", "--yes"]);
@@ -240,7 +240,8 @@ fn all_installs_and_uninstalls_claude_opencode_and_codex() {
     assert_eq!(opencode["mcp"]["vlt"]["command"][1], "mcp");
     let codex = fs::read_to_string(home.join(".codex/config.toml")).unwrap();
     assert!(codex.contains("[mcp_servers.vlt]") && codex.contains("args = [\"mcp\"]"), "{codex}");
-    for skill in [".claude/skills/vlt", ".config/opencode/skills/vlt", ".codex/skills/vlt"] {
+    assert_eq!(json_of(&home.join(".pi/agent/mcp.json"))["mcpServers"]["vlt"]["type"], "stdio");
+    for skill in [".claude/skills/vlt", ".config/opencode/skills/vlt", ".codex/skills/vlt", ".pi/agent/skills/vlt"] {
         assert!(home.join(skill).join("SKILL.md").is_file(), "{skill}");
     }
 
@@ -248,7 +249,8 @@ fn all_installs_and_uninstalls_claude_opencode_and_codex() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(json_of(&home.join(".config/opencode/opencode.json"))["mcp"].get("vlt").is_none());
     assert!(!fs::read_to_string(home.join(".codex/config.toml")).unwrap().contains("vlt"));
-    for skill in [".claude/skills/vlt", ".config/opencode/skills/vlt", ".codex/skills/vlt"] {
+    assert!(json_of(&home.join(".pi/agent/mcp.json"))["mcpServers"].get("vlt").is_none());
+    for skill in [".claude/skills/vlt", ".config/opencode/skills/vlt", ".codex/skills/vlt", ".pi/agent/skills/vlt"] {
         assert!(!home.join(skill).exists(), "{skill}");
     }
 }

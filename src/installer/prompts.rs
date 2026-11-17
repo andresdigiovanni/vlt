@@ -28,7 +28,12 @@ pub fn confirm(message: &str, default: bool) -> Result<bool> {
 
 /// Multi-select of the agents to configure; every supported agent is preselected.
 pub fn select_targets() -> Result<Vec<Target>> {
-    let all: &[(Target, &str)] = &[(Target::Claude, "Claude Code"), (Target::Opencode, "opencode"), (Target::Codex, "Codex")];
+    let all: &[(Target, &str)] = &[
+        (Target::Claude, "Claude Code"),
+        (Target::Opencode, "opencode"),
+        (Target::Codex, "Codex"),
+        (Target::Pi, "pi"),
+    ];
     let labels: Vec<&str> = all.iter().map(|(_, l)| *l).collect();
     let preselected: Vec<usize> = (0..all.len()).collect();
     let chosen = inquire::MultiSelect::new("Agents to configure:", labels)

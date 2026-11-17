@@ -159,6 +159,7 @@ if [ -f "$VLT_CONFIG" ]; then
   [ -f "$HOME/.claude/skills/vlt/SKILL.md" ] && SETUP+=(--target claude)
   [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/skills/vlt/SKILL.md" ] && SETUP+=(--target opencode)
   [ -f "$HOME/.codex/skills/vlt/SKILL.md" ] && SETUP+=(--target codex)
+  [ -f "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/skills/vlt/SKILL.md" ] && SETUP+=(--target pi)
 fi
 
 if [ ${#SETUP[@]} -gt 0 ]; then
