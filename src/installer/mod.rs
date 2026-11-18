@@ -35,6 +35,12 @@ pub struct InstallOptions {
     pub yes: bool,
 }
 
+pub struct UninstallOptions {
+    pub targets: Vec<Target>,
+    pub all: bool,
+    pub yes: bool,
+}
+
 /// Expands a leading `~` and makes `p` absolute against the current directory.
 fn absolute(p: &Path, home: &Path) -> Result<PathBuf> {
     let mut comps = p.components();
@@ -73,11 +79,17 @@ fn resolve_vault(opts: &InstallOptions, existing: Option<&Path>, home: &Path) ->
 }
 
 fn resolve_targets(opts: &InstallOptions) -> Result<Vec<Target>> {
-    let targets = if opts.all {
+    resolve_selected_targets(&opts.targets, opts.all, opts.yes)
+}
+
+/// Shared by `install` and `uninstall`: `--all` or `--target` picks the agents, nothing
+/// asks, and `--yes` without a selection is an error.
+fn resolve_selected_targets(targets: &[Target], all: bool, yes: bool) -> Result<Vec<Target>> {
+    let targets = if all {
         Target::value_variants().to_vec()
-    } else if !opts.targets.is_empty() {
-        opts.targets.clone()
-    } else if opts.yes {
+    } else if !targets.is_empty() {
+        targets.to_vec()
+    } else if yes {
         return Err(VltError::InvalidArguments("pass --target or --all".into()));
     } else {
         prompts::select_targets()?
@@ -258,32 +270,58 @@ fn home_decision(vlt_home: &Path, config_path: &Path) -> HomeDecision {
     }
 }
 
-/// `vlt uninstall`: removes the MCP entries and Skills; deletes vlt home only after an interactive yes.
-pub fn uninstall(yes: bool) -> Result<()> {
+/// Removes the MCP entry and Skill of `target`, printing what it did.
+fn uninstall_target(target: Target, home: &Path) -> Result<()> {
+    let action = match target {
+        Target::Claude => deconfigure_claude(home)?,
+        Target::Opencode => deconfigure_opencode(&opencode_dir(home))?,
+        Target::Codex => deconfigure_codex(home)?,
+        Target::Pi => deconfigure_pi(home)?,
+    };
+    let config = shown(&mcp_config_path(target, home), home);
+    match action {
+        SetupAction::Removed => say(format_args!("✓ MCP server removed from {config}\n"))?,
+        SetupAction::NeedsManualEdit(hint) => say(format_args!("! MCP server not removed from {config}: {hint}\n"))?,
+        _ => say(format_args!("MCP server was not registered in {config}\n"))?,
+    }
+    let path = skill::skill_path(home, target);
+    let dir = path.parent().unwrap_or(&path).display().to_string();
+    if uninstall_skill(home, target)? {
+        say(format_args!("✓ Skill removed from {dir}\n"))?;
+    } else {
+        say(format_args!("Skill was not installed at {dir}\n"))?;
+    }
+    Ok(())
+}
+
+/// True when the MCP entry or the Skill of `target` is still present on disk.
+fn target_still_setup(target: Target, home: &Path) -> bool {
+    if skill::skill_path(home, target).parent().is_some_and(Path::exists) {
+        return true;
+    }
+    match target {
+        Target::Claude => agentsetup::entry_present_claude(home),
+        Target::Opencode => agentsetup::entry_present_opencode(&opencode_dir(home)),
+        Target::Codex => agentsetup::entry_present_codex(home),
+        Target::Pi => agentsetup::entry_present_pi(home),
+    }
+}
+
+/// `vlt uninstall`: removes the MCP entry and Skill of the selected agents (`--target`,
+/// default all); deletes vlt home only after an interactive yes, and only when no agent
+/// remains set up.
+pub fn uninstall(opts: UninstallOptions) -> Result<()> {
     let home = paths::home_dir()?;
     let vlt_home = paths::vlt_home()?;
-    for &target in Target::value_variants() {
-        let action = match target {
-            Target::Claude => deconfigure_claude(&home)?,
-            Target::Opencode => deconfigure_opencode(&opencode_dir(&home))?,
-            Target::Codex => deconfigure_codex(&home)?,
-            Target::Pi => deconfigure_pi(&home)?,
-        };
-        let config = shown(&mcp_config_path(target, &home), &home);
-        match action {
-            SetupAction::Removed => say(format_args!("✓ MCP server removed from {config}\n"))?,
-            SetupAction::NeedsManualEdit(hint) => say(format_args!("! MCP server not removed from {config}: {hint}\n"))?,
-            _ => say(format_args!("MCP server was not registered in {config}\n"))?,
-        }
-        let path = skill::skill_path(&home, target);
-        let dir = path.parent().unwrap_or(&path).display().to_string();
-        if uninstall_skill(&home, target)? {
-            say(format_args!("✓ Skill removed from {dir}\n"))?;
-        } else {
-            say(format_args!("Skill was not installed at {dir}\n"))?;
-        }
+    let targets = resolve_selected_targets(&opts.targets, opts.all, opts.yes)?;
+    for target in targets {
+        uninstall_target(target, &home)?;
     }
     if !vlt_home.exists() {
+        return Ok(());
+    }
+    if Target::value_variants().iter().any(|&t| target_still_setup(t, &home)) {
+        say(format_args!("Kept {} because vlt is still set up for an agent\n", vlt_home.display()))?;
         return Ok(());
     }
     match home_decision(&vlt_home, &paths::config_path(&vlt_home)) {
@@ -299,7 +337,7 @@ pub fn uninstall(yes: bool) -> Result<()> {
         HomeDecision::Ask => {}
     }
     let question = format!("Delete {} (config, index and models)?", vlt_home.display());
-    if !yes && prompts::confirm(&question, false)? {
+    if !opts.yes && prompts::confirm(&question, false)? {
         std::fs::remove_dir_all(&vlt_home)?;
         say(format_args!("✓ Deleted {}\n", vlt_home.display()))?;
     } else {

@@ -25,7 +25,7 @@ fn install_is_idempotent_and_uninstall_keeps_data() {
     assert_eq!(cfg.vault, vault);
     assert!(home.join(".vlt/index/vlt.db").is_file());
 
-    let out = cmd(home).args(["uninstall", "--yes"]).output().unwrap();
+    let out = cmd(home).args(["uninstall", "--all", "--yes"]).output().unwrap();
     assert!(out.status.success());
     let claude: serde_json::Value = serde_json::from_str(&fs::read_to_string(home.join(".claude.json")).unwrap()).unwrap();
     assert!(claude["mcpServers"].get("vlt").is_none());
@@ -132,7 +132,7 @@ fn uninstall_keeps_other_mcp_servers() {
     let home = d.path();
     fs::write(home.join(".claude.json"), r#"{"theme":"dark","mcpServers":{"other":{"command":"x"}}}"#).unwrap();
     assert!(install(home, &["--vault", home.join("v").to_str().unwrap(), "--target", "claude", "--target", "claude", "--yes"]).status.success());
-    let out = cmd(home).args(["uninstall", "--yes"]).output().unwrap();
+    let out = cmd(home).args(["uninstall", "--all", "--yes"]).output().unwrap();
     assert!(out.status.success());
     let v: serde_json::Value = serde_json::from_str(&fs::read_to_string(home.join(".claude.json")).unwrap()).unwrap();
     assert_eq!(v, serde_json::json!({"theme":"dark","mcpServers":{"other":{"command":"x"}}}));
@@ -171,7 +171,7 @@ fn uninstall_yes_keeps_vlt_home_that_contains_the_vault() {
     let home = d.path();
     let vault = home.join(".vlt/vault");
     assert!(install(home, &["--vault", vault.to_str().unwrap(), "--yes", "--target", "claude"]).status.success());
-    let out = cmd(home).args(["uninstall", "--yes"]).output().unwrap();
+    let out = cmd(home).args(["uninstall", "--all", "--yes"]).output().unwrap();
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("because it contains the vault"), "{text}");
@@ -184,7 +184,7 @@ fn uninstall_yes_keeps_vlt_home_when_the_config_cannot_be_read() {
     let home = d.path();
     fs::create_dir_all(home.join(".vlt")).unwrap();
     fs::write(home.join(".vlt/config.toml"), "vault = \"/v\"\nbogus = 1\n").unwrap();
-    let out = cmd(home).args(["uninstall", "--yes"]).output().unwrap();
+    let out = cmd(home).args(["uninstall", "--all", "--yes"]).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("because config.toml could not be read, so the vault location is unknown"), "{text}");
@@ -217,7 +217,7 @@ fn install_and_uninstall_finish_quietly_with_exit_0_when_stdout_is_closed() {
     assert_eq!(out.status.code(), Some(0), "{err}");
     assert!(home.join(".vlt/index/vlt.db").is_file(), "the install still ran to the end");
 
-    let out = with_stdout_closed(home, &["uninstall", "--yes"]);
+    let out = with_stdout_closed(home, &["uninstall", "--all", "--yes"]);
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(!err.contains("panicked"), "{err}");
     assert_eq!(out.status.code(), Some(0), "{err}");
@@ -245,7 +245,7 @@ fn all_installs_and_uninstalls_claude_opencode_codex_and_pi() {
         assert!(home.join(skill).join("SKILL.md").is_file(), "{skill}");
     }
 
-    let out = cmd(home).args(["uninstall", "--yes"]).output().unwrap();
+    let out = cmd(home).args(["uninstall", "--all", "--yes"]).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(json_of(&home.join(".config/opencode/opencode.json"))["mcp"].get("vlt").is_none());
     assert!(!fs::read_to_string(home.join(".codex/config.toml")).unwrap().contains("vlt"));
@@ -297,10 +297,70 @@ fn opencode_config_with_comments_is_left_alone_and_the_install_goes_on() {
     assert!(home.join(".codex/config.toml").is_file() && home.join(".claude.json").is_file(), "the other agents are configured");
     assert!(home.join(".vlt/index/vlt.db").is_file(), "the install reached the index");
 
-    let out = cmd(home).args(["uninstall", "--yes"]).output().unwrap();
+    let out = cmd(home).args(["uninstall", "--all", "--yes"]).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(String::from_utf8_lossy(&out.stdout).contains("by hand"));
     assert_eq!(fs::read_to_string(dir.join("opencode.jsonc")).unwrap(), original);
+    assert!(home.join(".vlt/config.toml").is_file(), "the manual-edit entry may survive, so vlt home is kept");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("vlt is still set up for an agent"), "the keep says why");
+}
+
+#[test]
+fn uninstall_target_removes_only_that_agent_and_keeps_vlt_home_silently() {
+    let d = tempfile::tempdir().unwrap();
+    let home = d.path();
+    assert!(install(home, &["--vault", home.join("v").to_str().unwrap(), "--all", "--yes"]).status.success());
+
+    let out = cmd(home).args(["uninstall", "--target", "claude", "--yes"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let claude: serde_json::Value = serde_json::from_str(&fs::read_to_string(home.join(".claude.json")).unwrap()).unwrap();
+    assert!(claude["mcpServers"].get("vlt").is_none(), "claude's MCP entry is gone");
+    assert!(!home.join(".claude/skills/vlt").exists(), "claude's Skill is gone");
+    // The other agents keep everything.
+    assert!(home.join(".codex/config.toml").is_file());
+    assert!(fs::read_to_string(home.join(".codex/config.toml")).unwrap().contains("vlt"));
+    assert!(home.join(".config/opencode/skills/vlt/SKILL.md").is_file());
+    assert!(home.join(".pi/agent/skills/vlt/SKILL.md").is_file());
+    // A partial uninstall never asks about or deletes vlt home, even outside a vault.
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(home.join(".vlt/config.toml").is_file(), "vlt home kept");
+    assert!(text.contains("vlt is still set up for an agent"), "the guard's own message: {text}");
+    assert!(!text.contains("Delete "), "{text}");
+}
+
+#[test]
+fn uninstall_all_equals_plain_uninstall() {
+    let d = tempfile::tempdir().unwrap();
+    let home = d.path();
+    assert!(install(home, &["--vault", home.join("v").to_str().unwrap(), "--all", "--yes"]).status.success());
+    let out = cmd(home).args(["uninstall", "--all", "--yes"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(json_of(&home.join(".claude.json"))["mcpServers"].get("vlt").is_none());
+    assert!(json_of(&home.join(".config/opencode/opencode.json"))["mcp"].get("vlt").is_none());
+    assert!(!fs::read_to_string(home.join(".codex/config.toml")).unwrap().contains("vlt"));
+    assert!(json_of(&home.join(".pi/agent/mcp.json"))["mcpServers"].get("vlt").is_none());
+    assert!(home.join(".vlt/config.toml").is_file(), "--yes keeps vlt home, as plain uninstall does");
+}
+
+#[test]
+fn uninstall_yes_without_target_is_an_error() {
+    let d = tempfile::tempdir().unwrap();
+    let out = cmd(d.path()).args(["uninstall", "--yes"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--target"));
+    assert!(!d.path().join(".vlt").exists(), "nothing created or deleted");
+}
+
+#[test]
+fn uninstalling_the_last_agent_offers_to_delete_vlt_home() {
+    let d = tempfile::tempdir().unwrap();
+    let home = d.path();
+    assert!(install(home, &["--vault", home.join("v").to_str().unwrap(), "--target", "claude", "--yes"]).status.success());
+    let out = cmd(home).args(["uninstall", "--target", "claude", "--yes"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(home.join(".vlt/config.toml").is_file(), "--yes keeps vlt home, as plain uninstall does");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("Kept") && text.contains(".vlt"), "the vlt-home decision is reported: {text}");
 }
 
 #[test]

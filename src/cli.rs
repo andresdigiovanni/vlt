@@ -9,7 +9,7 @@ use crate::audit::{AuditResponse, Section};
 use crate::documents::{DocumentResponse, FoldersResponse, PropertiesResponse};
 use crate::indexer::Progress;
 use crate::installer::models::{missing, pull_showing_progress};
-use crate::installer::{InstallOptions, Target};
+use crate::installer::{InstallOptions, Target, UninstallOptions};
 use crate::ml::models::Models;
 use crate::paths;
 use crate::related::RelatedResponse;
@@ -41,8 +41,14 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Remove the MCP server and Skill from every agent
+    /// Remove the MCP server and Skill from one agent (`--target`) or every agent
     Uninstall {
+        /// Agent to clean up (repeatable; without it, every agent)
+        #[arg(long = "target", value_enum)]
+        targets: Vec<Target>,
+        /// Configure every supported agent
+        #[arg(long)]
+        all: bool,
         /// Do not ask; keeps ~/.vlt/
         #[arg(long)]
         yes: bool,
@@ -178,7 +184,7 @@ fn dispatch(cmd: Command) -> Result<()> {
         Command::Install { vault, targets, all, yes } => {
             crate::installer::install(InstallOptions { vault, targets, all, yes })
         }
-        Command::Uninstall { yes } => crate::installer::uninstall(yes),
+        Command::Uninstall { targets, all, yes } => crate::installer::uninstall(UninstallOptions { targets, all, yes }),
         Command::Search { query, where_, path_prefix, limit, json } => {
             let where_ = if where_.is_empty() { None } else { Some(parse_cli_where(&where_)?) };
             let app = App::load()?;

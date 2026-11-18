@@ -89,6 +89,12 @@ rm ~/.local/bin/vlt
 
 `vlt uninstall` disconnects vlt from every agent and asks whether to delete `~/.vlt/`. It never touches your vault.
 
+To disconnect vlt from one agent only, pass it as a target; `~/.vlt/` is kept while another agent still uses vlt:
+
+```bash
+vlt uninstall --target claude        # or --target opencode|codex|pi, repeatable; --all for every agent
+```
+
 ## Usage
 
 ### With your agent

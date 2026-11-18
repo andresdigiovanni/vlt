@@ -346,10 +346,90 @@ pub fn deconfigure_pi_from(env: Option<OsString>, home: &Path) -> Result<SetupAc
     Ok(SetupAction::Removed)
 }
 
+/// True when the `vlt` MCP entry of `target` may still be in its config: present, or a
+/// file that cannot be parsed, whose absence of the entry cannot be proven.
+pub fn entry_present_claude(home: &Path) -> bool {
+    entry_in_json(&claude_json(home), "mcpServers")
+}
+
+pub fn entry_present_opencode(dir: &Path) -> bool {
+    let path = opencode_file(dir);
+    if !path.is_file() {
+        return false;
+    }
+    match std::fs::read_to_string(&path).ok().as_deref().map(parse_opencode) {
+        Some(Some(root)) => root.get("mcp").and_then(Value::as_object).is_some_and(|s| s.contains_key(SERVER)),
+        // Not plain JSON: the manual-edit case, where the entry may survive.
+        _ => true,
+    }
+}
+
+pub fn entry_present_codex(home: &Path) -> bool {
+    let path = codex_file(home);
+    if !path.is_file() {
+        return false;
+    }
+    match std::fs::read_to_string(&path).ok().and_then(|raw| raw.parse::<toml_edit::DocumentMut>().ok()) {
+        Some(doc) => doc.get("mcp_servers").and_then(|s| s.as_table_like()).is_some_and(|s| s.contains_key(SERVER)),
+        None => true,
+    }
+}
+
+pub fn entry_present_pi(home: &Path) -> bool {
+    entry_present_pi_from(std::env::var_os("PI_CODING_AGENT_DIR"), home)
+}
+
+/// `entry_present_pi` with the agent-dir override injected, so tests never touch the process env.
+pub fn entry_present_pi_from(env: Option<OsString>, home: &Path) -> bool {
+    entry_in_json(&pi_file_from(env, home), "mcpServers")
+}
+
+fn entry_in_json(path: &Path, key: &str) -> bool {
+    match read_root(path) {
+        Ok(None) => false,
+        Ok(Some(root)) => root.get(key).and_then(Value::as_object).is_some_and(|s| s.contains_key(SERVER)),
+        Err(_) => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn entry_present_reflects_the_vlt_entry_only() {
+        let d = tempfile::tempdir().unwrap();
+        let h = d.path();
+        // No config anywhere: nothing present, nothing created.
+        assert!(!entry_present_claude(h) && !entry_present_codex(h) && !entry_present_pi_from(None, h));
+        assert!(!entry_present_opencode(&d.path().join("opencode")));
+        assert!(!h.join(".claude.json").exists() && !h.join(".codex").exists() && !h.join(".pi").exists());
+
+        configure_claude(h, Path::new("/bin/vlt")).unwrap();
+        configure_codex(h, Path::new("/bin/vlt")).unwrap();
+        configure_opencode(&h.join(".config/opencode"), Path::new("/bin/vlt")).unwrap();
+        configure_pi_from(None, h, Path::new("/bin/vlt")).unwrap();
+        assert!(entry_present_claude(h) && entry_present_codex(h));
+        assert!(entry_present_opencode(&h.join(".config/opencode")) && entry_present_pi_from(None, h));
+        deconfigure_claude(h).unwrap();
+        deconfigure_codex(h).unwrap();
+        deconfigure_opencode(&h.join(".config/opencode")).unwrap();
+        deconfigure_pi_from(None, h).unwrap();
+        assert!(!entry_present_claude(h) && !entry_present_codex(h));
+        assert!(!entry_present_opencode(&h.join(".config/opencode")) && !entry_present_pi_from(None, h));
+
+        // An unparsable file may hide the entry: conservative true.
+        std::fs::write(h.join(".claude.json"), "{not json").unwrap();
+        std::fs::create_dir_all(h.join(".codex")).unwrap();
+        std::fs::write(h.join(".codex/config.toml"), "not = = toml").unwrap();
+        std::fs::create_dir_all(h.join(".config/opencode")).unwrap();
+        std::fs::write(h.join(".config/opencode/opencode.json"), "{oops").unwrap();
+        assert!(entry_present_claude(h) && entry_present_codex(h) && entry_present_opencode(&h.join(".config/opencode")));
+        // Other servers do not count.
+        std::fs::write(h.join(".claude.json"), r#"{"mcpServers":{"other":{"command":"x"}}}"#).unwrap();
+        assert!(!entry_present_claude(h));
+    }
+
     fn read(h: &Path) -> serde_json::Value { serde_json::from_str(&std::fs::read_to_string(h.join(".claude.json")).unwrap()).unwrap() }
     fn pi_read(h: &Path) -> serde_json::Value {
         serde_json::from_str(&std::fs::read_to_string(h.join(".pi/agent/mcp.json")).unwrap()).unwrap()

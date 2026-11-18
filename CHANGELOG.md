@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `vlt uninstall --target claude` (also `opencode`, `codex`, `pi`; repeatable, `--all` for every) removes the MCP server entry and the Skill of only those agents. It keeps `~/.vlt/` while any agent still has vlt set up, so uninstalling one of several agents can no longer delete the index and models the others use; without `--target` the command asks which agents to clean up, as `vlt install` does, and `--yes` without a target is an error.
+
 ## [0.6.0] - 2026-11-18
 
 ### Added
