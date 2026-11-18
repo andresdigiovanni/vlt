@@ -9,7 +9,7 @@ name: Release
 #      branch), so the published release notes are never sparse just because
 #      the maintainer didn't pre-stage the [<version>] block by hand,
 #   5. builds a release binary for every platform (rusqlite bundles C, so each
-#      target is built on a runner of its own OS; macos-14 builds x86_64 from
+#      target is built on a runner of its own OS; macos-15 builds x86_64 from
 #      its arm64 toolchain with the Apple cross target). The build job runs on
 #      the triggered commit, before steps 2 and 4 push Cargo.lock/CHANGELOG.md
 #      commits, so the tag below points at a commit that differs from the built
@@ -46,7 +46,7 @@ jobs:
             targets: x86_64-unknown-linux-gnu
           - runner: ubuntu-22.04-arm
             targets: aarch64-unknown-linux-gnu
-          - runner: macos-14
+          - runner: macos-15
             targets: aarch64-apple-darwin x86_64-apple-darwin
     runs-on: ${{ matrix.runner }}
     steps:
